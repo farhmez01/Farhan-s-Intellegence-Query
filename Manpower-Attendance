@@ -1,0 +1,110 @@
+WITH dt1 AS (
+    SELECT date, user_id, wh_check_in, division_in FROM `swift-solutions.inreval.mps_presence` WHERE 1 = 1
+    UNION ALL
+    SELECT date, user_id, wh_check_in, division_in FROM `swift-solutions.inreval.mps_overtime` WHERE 1 = 1
+),
+dt2 AS (
+    SELECT
+        b.id,
+        aa.wh_check_in,
+        aa.date,
+        c.name AS origin,
+        aa.division_in,
+        b.nik,
+        b.name,
+        b.emp_status
+    FROM
+        dt1 aa
+    LEFT JOIN `swift-solutions.inreval.mps_users` b ON aa.user_id = b.id
+    LEFT JOIN `swift-solutions.inreval.warehouse_point` c ON b.wh_point_id = c.id
+    WHERE
+        c.id IS NOT NULL
+),
+dtl_report AS (
+    SELECT
+        a.wh_check_in AS id,
+        a.date,
+        a.origin,
+        a.division_in AS division,
+        a.nik,
+        a.name,
+        a.emp_status,
+        b.created AS ci,
+        CASE WHEN b.check_out IS NULL THEN NULL ELSE b.updated END AS co,
+        CASE WHEN b.working_hour >= 8 THEN 8 ELSE b.working_hour END AS actual_working_hour,
+        c.working_hour AS actual_ot_hour,
+        CASE
+            WHEN b.payment_category IS NULL THEN NULL
+            WHEN b.payment_category = 0 THEN 'Unpaid'
+            WHEN b.payment_category = (1.0/3) THEN 'Cancelled'
+            WHEN b.payment_category = 0.5 THEN 'Half Day'
+            ELSE 'Full Day'
+        END AS payment_category,
+        CASE
+            WHEN a.emp_status IN ('Permanent', 'Contract', 'Probation') THEN b.payment_category * (d.rate / 30.0)
+            WHEN a.emp_status IN ('Daily Worker (Regular)', 'Daily Worker (Event)') THEN 
+                CASE
+                    WHEN b.payment_category = (1.0/3) THEN 
+                        CASE WHEN (b.payment_category * normal) > 50000 THEN 50000 ELSE (b.payment_category * normal) END
+                    ELSE (b.payment_category * normal)
+                END
+            WHEN a.emp_status = 'OJT' THEN (b.payment_category * 50000)
+        END AS basic_salary,
+        CASE
+            WHEN a.emp_status IN ('Permanent', 'Contract', 'Probation') THEN 
+                CASE
+                    WHEN c.working_hour = 1 THEN ((1.0/173) * d.rate) * 1.5
+                    ELSE (((((1.0/173) * d.rate) * 2) * (c.working_hour - 1)) + (((1.0/173) * d.rate) * 1.5))
+                END
+            WHEN a.emp_status IN ('Daily Worker (Regular)', 'Daily Worker (Event)', 'OJT') THEN 
+                CASE
+                    WHEN c.working_hour = 1 THEN (1.5/173) * d.rate21
+                    ELSE ((((2.0/173) * d.rate21) * (c.working_hour - 1)) + ((1.5/173) * d.rate21))
+                END
+        END AS overtime
+    FROM
+        dt2 a
+    LEFT JOIN `swift-solutions.inreval.mps_presence` b ON a.id = b.user_id AND a.date = b.date
+    LEFT JOIN `swift-solutions.inreval.mps_overtime` c ON a.id = c.user_id AND a.date = c.date
+    LEFT JOIN `swift-solutions.inreval.mps_rate` d ON a.wh_check_in = d.wh_point_id
+    WHERE
+        1 = 1
+),
+total_orders AS (
+    SELECT 
+        warehouse_name,
+        DATE(finished_time) AS date, 
+        COALESCE(SUM(basket_size), 0) AS total_processed_item,
+        COALESCE(SUM(CASE WHEN order_number IS NOT NULL THEN 1 ELSE 0 END), 0) AS total_order,
+        CONCAT(ROUND(COALESCE((SUM(IF(meet_sla_v3, 100, 0))/COUNT(*)), 0), 0), '%') AS sla
+    FROM 
+        `production-data-245d.derived.order_status_history_timestamp` 
+    WHERE 
+        finished_time >= '2023-09-01' 
+        AND pending_time IS NOT NULL
+        AND tenant_name <> 'Swift Packaging'
+        AND finished_time <= '2023-10-10' 
+        AND status = 'finished'
+        AND order_type <> 'B2B'
+    GROUP BY
+        warehouse_name,
+        DATE(finished_time)
+)
+SELECT
+    dtl.origin AS warehouse,
+    dtl.date,
+    total_orders.total_processed_item,
+    total_orders.total_order,
+    total_orders.sla,
+    COALESCE(SUM(dtl.basic_salary), 0) AS total_manpower,
+    COALESCE(SUM(dtl.overtime), 0) AS total_salary
+FROM
+    dtl_report dtl
+INNER JOIN
+    total_orders ON dtl.origin = total_orders.warehouse_name AND dtl.date = total_orders.date
+GROUP BY
+    dtl.origin,
+    dtl.date,
+    total_orders.total_processed_item,
+    total_orders.total_order,
+    total_orders.sla;

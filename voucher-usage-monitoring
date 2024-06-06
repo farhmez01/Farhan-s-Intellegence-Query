@@ -1,0 +1,55 @@
+with promo_burn_databank as (SELECT promo_code,
+       ROUND(MAX(total_subsidy/subtotal_price)*100, 1) AS burn_rate,
+       max(total_subsidy) max_benefit,
+       max(total_subsidy)/ROUND(MAX(total_subsidy/subtotal_price)*100, 1)*100 max_benefit_aov,
+       COUNT(DISTINCT invoice_ref_num) AS order_num
+FROM `int_dm_logistics_transaction.fulfillment_order_promo`
+WHERE owoc_group_order_id IS NULL
+  AND subtotal_price > 0
+  and total_subsidy>0
+  AND is_bo_voucher = FALSE
+GROUP BY promo_code
+ORDER BY order_num DESC)
+
+
+SELECT * FROM (
+SELECT
+  EXTRACT(DATE FROM payment_verified_timestamp) pv_date
+  ,burn_rate, 
+  max_benefit,
+  max_benefit_aov,
+  CASE 
+    WHEN promo_code LIKE "BBI%" OR promo_code LIKE "%LOKAL%" THEN "Beli Lokal"
+    WHEN promo_code LIKE "BCI%" THEN "Buyer Coupon Injection"
+    WHEN promo_code LIKE "SREB%" THEN "Ramadhan Extra"
+    WHEN promo_code LIKE "%KK%APRA%" THEN "Lebaran Extra"
+    WHEN promo_code LIKE "BP%" THEN "Buyer Promo"
+    WHEN promo_code LIKE "BAUACT%" THEN "BAU ACT"
+    
+    ELSE "Non Voucher Order" 
+    END AS order_type
+  , shop_name,
+  case when item_price < 100000 then "0-100k"
+when item_price < 200000 then "100k-200k"
+when item_price < 300000 then "200k-300k"
+else ">300k" end tiv_group
+  , COUNT(DISTINCT(invoice_ref_number)) daily_order
+FROM `int_dm_logistics_transaction.dm_order_level`
+LEFT JOIN 
+  (
+    SELECT invoice_ref_num , t1.promo_code , burn_rate,
+    max_benefit,
+    max_benefit_aov,
+    FROM `int_dm_logistics_transaction.fulfillment_order_promo` t1 left join promo_burn_databank t2
+    on t1.promo_code=t2.promo_code
+    WHERE t1.promo_code LIKE "BBI%" 
+    OR t1.promo_code LIKE "%LOKAL%" 
+    OR t1.promo_code LIKE "BCI%" OR 
+    t1.promo_code LIKE "SREB%" OR 
+    t1.promo_code LIKE "%KK%APRA%" OR 
+    t1.promo_code LIKE "BP%" OR 
+    t1.promo_code LIKE "BAUACT%"
+  )
+ON invoice_ref_num = invoice_ref_number
+where date_diff(extract(date from current_timestamp()),extract(date from payment_verified_timestamp),day)<=20
+GROUP BY 1, 2, 3,4,5,6,7) ORDER BY 8 DESC

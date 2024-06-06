@@ -1,0 +1,50 @@
+WITH total_manpower_cte AS (
+  SELECT 
+    DATE(date) as date,
+    warehouse_location as warehouse_name,
+    activity_area,
+    sum(actual) as total_manpower
+  FROM 
+    `google_sheet_collection.plan_actual_dw_v1`
+  WHERE date is not null
+  GROUP BY 
+    date, warehouse_name, activity_area
+)
+
+SELECT 
+  total_manpower_cte.date,
+  total_manpower_cte.warehouse_name,
+  total_manpower_cte.activity_area,
+  CASE 
+    WHEN total_manpower_cte.activity_area = 'inbound'
+      THEN SUM(inbound_daily_putaway.total_putaway)
+    WHEN total_manpower_cte.activity_area = 'outbound'
+      THEN SUM(outbound_daily_routed_v1.total_item)
+    ELSE NULL
+  END AS quantity,
+
+  total_manpower_cte.total_manpower,
+
+  CASE 
+    WHEN total_manpower_cte.activity_area = 'inbound' AND total_manpower_cte.total_manpower > 0 
+      THEN SUM(inbound_daily_putaway.total_putaway) / total_manpower_cte.total_manpower
+    WHEN total_manpower_cte.activity_area = 'outbound' AND total_manpower_cte.total_manpower > 0 
+      THEN SUM(outbound_daily_routed_v1.total_item) / total_manpower_cte.total_manpower
+    ELSE NULL
+  END AS productivity
+FROM 
+  total_manpower_cte
+LEFT JOIN 
+  bi_inbound_marts.inbound_daily_putaway 
+ON 
+  total_manpower_cte.date = inbound_daily_putaway.date 
+  AND total_manpower_cte.warehouse_name = inbound_daily_putaway.warehouse_name
+LEFT JOIN 
+  outbound.outbound_daily_routed_v1 
+ON 
+  total_manpower_cte.date = outbound_daily_routed_v1.date 
+  AND total_manpower_cte.warehouse_name = outbound_daily_routed_v1.warehouse_name
+WHERE 
+  total_manpower_cte.activity_area IN ('inbound', 'outbound')
+GROUP BY
+  total_manpower_cte.date, total_manpower_cte.warehouse_name, total_manpower_cte.activity_area, total_manpower_cte.total_manpower;

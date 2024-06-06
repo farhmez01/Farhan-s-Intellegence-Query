@@ -1,0 +1,95 @@
+WITH orders AS (
+  SELECT
+    DATE(jkt_unallocated_timestamp) AS date_key,
+    warehouse_name,
+    tenant_name,
+    product_name,
+    SUM(assigned_quantity) AS items_sold
+  FROM
+    `gtl-prod-data-central.datawarehouse.ft_outbound_line_core`
+  WHERE 
+    DATE(jkt_unallocated_timestamp) >= '2024-01-01'
+    AND warehouse_name NOT LIKE '%TokoNOW%'
+    AND outbound_number NOT LIKE '%WSN%'
+    AND outbound_class LIKE '%b2c/%'
+    AND tenant_name NOT LIKE '%Tokonow%'
+    AND tenant_name NOT LIKE '%2ndmile%'
+    AND tenant_name NOT LIKE '%Swift%'
+    AND tenant_name NOT LIKE '%SWIFT%'
+    AND tenant_name NOT LIKE '%GSN%'
+    AND tenant_name NOT LIKE '%Packaging%'
+  GROUP BY 
+    1, 2, 3, 4
+),
+
+pareto_tenant AS (
+  SELECT
+    warehouse_name,
+    tenant_name
+FROM (
+    SELECT
+        warehouse_name,
+        tenant_name,
+        sales,
+        ROW_NUMBER() OVER (PARTITION BY warehouse_name ORDER BY sales DESC) AS row_num
+    FROM (
+        SELECT
+        warehouse_name,
+        tenant_name,
+        SUM(assigned_quantity) as sales
+        FROM `gtl-prod-data-central.datawarehouse.ft_outbound_line_core`
+        WHERE DATE(jkt_unallocated_timestamp) >= '2024-04-15'
+                AND tenant_name NOT LIKE '%Tokonow%'
+                AND tenant_name NOT LIKE '%SWIFT%'
+                AND tenant_name NOT LIKE '%2ndmile%'
+                AND tenant_name NOT LIKE '%Crossdock%'
+                AND tenant_name NOT LIKE '%Consumables%'
+        GROUP BY
+            warehouse_name, tenant_name
+    ) AS sales_per_tenant_per_warehouse
+) AS ranked_sales_per_tenant_per_warehouse
+WHERE row_num <= 20
+ORDER BY
+    warehouse_name DESC
+),
+
+pareto_product AS (
+  SELECT
+    o.warehouse_name,
+    o.tenant_name,
+    o.product_name,
+    SUM(o.items_sold) AS qty,
+    SUM(o.items_sold) / (SELECT SUM(items_sold) FROM orders WHERE tenant_name = o.tenant_name) AS cumulative_ratio
+  FROM orders o
+  INNER JOIN pareto_tenant p ON o.warehouse_name = p.warehouse_name AND o.tenant_name = p.tenant_name
+  --where o.date_key >= 'tanggal pertama campaign, either voucher or campaign'
+  --and o.date_key <= 'tanggal terakhir campaign, either voucher or campaign'
+  GROUP BY 1, 2, 3
+  HAVING cumulative_ratio <= 0.8
+)
+
+SELECT
+  a.date_key,
+  a.warehouse_name,
+  a.tenant_name,
+  a.product_name,
+  a.items_sold AS m0_qty,
+  COALESCE(d.qty, 0) AS m1_qty,
+  COALESCE(e.qty, 0) AS m2_qty,
+  COALESCE(f.qty, 0) AS m3_qty
+FROM
+  orders a
+INNER JOIN
+  pareto_tenant b ON b.tenant_name = a.tenant_name AND b.warehouse_name = a.warehouse_name
+INNER JOIN
+  pareto_product c ON c.tenant_name = a.tenant_name AND c.warehouse_name = a.warehouse_name AND c.product_name = a.product_name
+LEFT JOIN
+  (SELECT DATE_ADD(date_key, INTERVAL 1 MONTH) AS date_key, warehouse_name, tenant_name, product_name, items_sold AS qty FROM orders) d 
+  ON a.date_key = d.date_key AND d.tenant_name = a.tenant_name AND d.warehouse_name = a.warehouse_name AND d.product_name = a.product_name
+LEFT JOIN
+  (SELECT DATE_ADD(date_key, INTERVAL 2 MONTH) AS date_key, warehouse_name, tenant_name, product_name, items_sold AS qty FROM orders) e 
+  ON a.date_key = e.date_key AND e.tenant_name = a.tenant_name AND e.warehouse_name = a.warehouse_name AND e.product_name = a.product_name
+LEFT JOIN
+  (SELECT DATE_ADD(date_key, INTERVAL 3 MONTH) AS date_key, warehouse_name, tenant_name, product_name, items_sold AS qty FROM orders) f 
+  ON a.date_key = f.date_key AND f.tenant_name = a.tenant_name AND f.warehouse_name = a.warehouse_name AND f.product_name = a.product_name
+

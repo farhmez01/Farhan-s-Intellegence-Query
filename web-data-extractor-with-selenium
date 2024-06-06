@@ -1,0 +1,240 @@
+!pip install selenium
+!pip install beautifulsoup4
+!apt install chromium-chromedriver
+!pip install pandas
+
+from selenium.webdriver.common.by import By
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.keys import Keys
+
+from bs4 import BeautifulSoup
+import json
+import time
+import requests
+import pandas as pd
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+import time
+
+# Define the list of cities
+cities = ["Delaware"]
+industry = ["Retail"]
+
+# Define the URL
+url = "https://www.bizbuysell.com/"
+
+# Set up Chrome WebDriver
+op = webdriver.ChromeOptions()
+browser = webdriver.Chrome(options=op)
+browser.get(url)
+
+# Loop through each city
+for city in cities:
+    lead_no = 0
+    old_lead_no = 0
+    try:
+        city_search_info = browser.find_element(By.CLASS_NAME, 'mat-input-element.mat-form-field-autofill-control.mat-autocomplete-trigger.ng-tns-c84-1.ng-pristine.ng-valid.cdk-text-field-autofill-monitored')
+        city_search_info.send_keys(Keys.CONTROL + 'a', Keys.DELETE)
+        time.sleep(1)
+        city_search_info.send_keys(cities)
+        time.sleep(1)
+        city_search_info.send_keys(Keys.ENTER)
+        time.sleep(1)
+        
+        # Find all the city options
+        city_options = browser.find_elements(By.CLASS_NAME, 'ng-tns-c84-1.ng-star-inserted')
+            # Loop through the options and click the one that exactly matches the city name
+        for option in city_options:
+            if option.text == city:
+                option.click()
+                break
+        time.sleep(1)
+        
+        # Find the industry search input element and enter the industry
+        option_industry = browser.find_element(By.CLASS_NAME, 'fa.fa-chevron-down.down-arrow.ng-tns-c84-1')
+        option_industry.click()
+        time.sleep(3)
+
+        # Find the "Retail" option and click it
+        retail_option = browser.find_element(By.XPATH, "//li[contains(@class, 'industry-dropdown-options') and text()='Retail']")
+        retail_option.click()
+
+        time.sleep(1)
+
+        magnify_element = browser.find_element(By.CLASS_NAME, 'hide-on-mobile hide-on-tablet search-btn ng-tns-c84-1')
+        magnify_element.click
+
+    except Exception as e:
+        print("Error:", e)
+        continue
+
+        
+        location_search_info = browser.find_element(By.CLASS_NAME, 'Autocomplete_autocompleteInput__KhUYu.Autocomplete_roundRightBorder__QFFoe')
+        location_search_info.send_keys("United States")
+        time.sleep(3)
+        location_search_info.send_keys(Keys.ENTER)
+        time.sleep(3)
+        
+    except Exception as e:
+        print("Error:", e)
+        continue
+
+    next_button = browser.find_element(By.CLASS_NAME, 'button_Button__meEg5.button-base_Button__9SPjH')
+    
+    while old_lead_no <= lead_no:
+        if lead_no <= 50:
+            old_lead_no = lead_no
+            main = browser.find_element(By.CLASS_NAME, 'TwoColumnLayout_columnLeft__GHw3D')
+            city_data_info = main.find_elements(By.CLASS_NAME, 'cityCard.cityCard_cityCardContent__0_4vj')
+
+            try:
+                close_pop_up = browser.find_element(By.CLASS_NAME, 'CloseButton')
+                close_pop_up.click()
+                time.sleep(3)
+            except:
+                pass
+
+            for city in city_data_info:
+                lead_no += 1
+                try:
+                    city_name = city.find_element(By.CLASS_NAME, 'cityCard_cityTitle__rbjTE').text
+                except:
+                    city_name = 'N/A'
+                try:
+                    company_name = city.find_element(By.CLASS_NAME, 'EmployerProfile_employerName__8w0tV').text
+                except:
+                    company_name = 'N/A'
+                try:
+                    rating = city.find_element(By.CLASS_NAME, 'EEmployerProfile_ratingContainer__TK35e').text
+                except:
+                    rating = 'N/A'
+                try:
+                    city_location = city.find_element(By.CLASS_NAME, 'cityCard_location__N_iYE').text
+                except:
+                    city_location = 'N/A'
+                try:
+                    salary = city.find_element(By.CLASS_NAME, 'cityCard_salaryEstimate___m9kY').text
+                except:
+                    salary = 'N/A'
+
+                
+                
+                try:
+                    close_pop_up=browser.find_element(By.CLASS_NAME,'CloseButton')
+                    close_pop_up.click()
+                except:
+                    pass
+                city.click()
+                time.sleep(5)
+
+    
+                try:
+                    company_size='N/A'
+                    company_Type='N/A'
+                    Founded='N/A'
+                    Industry='N/A'
+                    Sector='N/A'
+                    Revenue='N/A'
+                    company_data_info=browser.find_elements(By.CLASS_NAME,'cityDetails_overviewItem__35s2T')
+                    for company_data in company_data_info:
+    
+    
+    
+                        company_data_category=company_data.find_element(By.CLASS_NAME,'cityDetails_overviewItemLabel__5vi0o')
+                        if 'Size' in company_data_category.text:
+                            company_size=company_data.find_element(By.CLASS_NAME,'cityDetails_overviewItemValue__5TqNi').text
+    
+                        elif 'Type' in company_data_category.text:
+                            company_Type=company_data.find_element(By.CLASS_NAME,'cityDetails_overviewItemValue__5TqNi').text
+    
+                        elif 'Founded' in company_data_category.text:
+                            Founded=company_data.find_element(By.CLASS_NAME,'cityDetails_overviewItemValue__5TqNi').text
+    
+                        elif 'Industry' in company_data_category.text:
+                            Industry=company_data.find_element(By.CLASS_NAME,'cityDetails_overviewItemValue__5TqNi').text
+    
+                        elif 'Sector' in company_data_category.text:
+                            Sector=company_data.find_element(By.CLASS_NAME,'cityDetails_overviewItemValue__5TqNi').text
+    
+                        elif 'Revenue' in company_data_category.text:
+                            Revenue=company_data.find_element(By.CLASS_NAME,'cityDetails_overviewItemValue__5TqNi').text
+    
+                except:
+                    print("error")
+                    pass
+                time.sleep(5)
+                try:
+                    ceo_name=browser.find_element(By.CLASS_NAME,'cityDetails_ceoName___ay5y.cityDetails_donutText__IacAE').text
+                except:
+                    ceo_name='N/A'
+                try:
+                    website_link_info=browser.find_element(By.CLASS_NAME,'cityDetails_cityDetailsHeader__qKuvs')
+                    company_website=website_link_info.find_element(By.TAG_NAME,'a').get_attribute('href')
+
+                
+                    browser.execute_script("window.open('');")
+
+                    browser.switch_to.window(browser.window_handles[1])
+            
+                    time.sleep(3)         
+                    browser.get(company_website)
+                    info_page_url = browser.current_url
+                    time.sleep(3) 
+                    company_website_info=browser.find_element(By.CLASS_NAME,'employer-overview__employer-overview-module__employerOverviewLink')
+                    company_website=company_website_info.text
+
+                    browser.close()
+                    browser.switch_to.window(browser.window_handles[0])
+                    time.sleep(3) 
+
+                except :
+                    company_website='N/A'
+    
+                
+    
+    
+    
+                #print(company_size,company_Type,Founded,Industry,Sector,Revenue,ceo_name,company_website)
+                #print(city_name,company_name,rating,city_location,company_size,ceo_name,company_website)
+                leads.append([company_name,"Glassdoor",  company_website,'N/A', 'N/A', city_name, 'N/A', Sector, urgency, city_location,
+                                              salary,
+                                              company_size, Industry, Revenue, Founded,ceo_name,rating])
+
+            next_button.click()
+            time.sleep(4)  
+        else:
+            break
+
+
+# Close the browser
+browser.quit()
+
+# Print the leads list
+for lead in leads:
+    print(lead)
+
+from selenium import webdriver
+
+# Initialize the WebDriver
+driver = webdriver.Chrome()
+
+# Open the webpage
+driver.get("https://www.glassdoor.com/Job/united-states-internet-of-things-jobs-SRCH_IL.0,13_IN1_KO14,32.htm")
+
+# Get the full HTML of the webpage
+html = driver.page_source
+
+# Print or process the HTML as needed
+print(html)
+
+# Close the WebDriver
+driver.quit()
+
+df=pd.DataFrame(leads,columns=["Company Name","Scrapping Website" ,"Website","Twitter","Contact Info (Email)","Position","Position Information",
+                               "Company Information","Urgency",
+                    "Regional Data","Salary","Company Size","Industry","Revenue","Founded","Ceo Name","rating"])
+
+df.to_excel("Glassdoor_lead_Generation3.xlsx")

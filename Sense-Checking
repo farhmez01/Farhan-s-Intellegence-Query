@@ -1,0 +1,409 @@
+with tenant_segmentation as (
+   select
+    warehouse_area,
+    tenant_name,
+    recent_segementation as segmentation
+  from
+    `gtl-prod-data-central.sandbox_ibp.tenant_segmentation`
+),
+
+ibp_fc0 as (
+SELECT
+    DATE(date_order) AS date_order,
+    EXTRACT(DAY FROM PARSE_DATE('%Y-%m-%d', date_order)) AS days_of_month,
+    FORMAT_DATE('%A', PARSE_DATE('%Y-%m-%d', date_order)) AS days,
+    EXTRACT(WEEK FROM PARSE_DATE('%Y-%m-%d', date_order)) AS week_number,
+    EXTRACT(MONTH FROM PARSE_DATE('%Y-%m-%d', date_order)) AS month_number,
+    FORMAT_DATE('%B', DATE(date_order)) AS month_name,
+    extract(year from PARSE_DATE('%Y-%m-%d', date_order)) AS year,
+    CASE
+        WHEN EXTRACT(DAY FROM PARSE_DATE('%Y-%m-%d', date_order)) = EXTRACT(MONTH FROM PARSE_DATE('%Y-%m-%d', date_order)) THEN 'DD'
+        WHEN EXTRACT(DAY FROM PARSE_DATE('%Y-%m-%d', date_order)) IN (25) THEN 'WIB'
+        WHEN EXTRACT(DAY FROM PARSE_DATE('%Y-%m-%d', date_order)) IN (26,27,28,29,30,31) THEN 'WIB2'
+        ELSE 'N'
+    END AS date_type,
+    CASE
+        WHEN warehouse_name LIKE '%Bandung%' THEN 'Bandung'
+        WHEN warehouse_name LIKE '%Medan%' THEN 'Medan'
+        WHEN warehouse_name LIKE '%Osowilangun%' THEN 'Surabaya'
+        WHEN warehouse_name LIKE '%Logos%' OR warehouse_name LIKE '%Jakarta%' OR warehouse_name LIKE '%Cawang%' OR warehouse_name LIKE '%Cilincing%' THEN 'Jabodetabek'
+        END AS warehouse_area,
+        warehouse_name,
+        tenant_name,
+        sum(ibp_final_order) as total_order,
+        sum(ibp_final_fc2) as total_qty
+FROM
+    `gtl-prod-data-central.sandbox_ibp.manpower_fc_per_wh_ibp` a
+group by
+    1,2,3,4,5,6,7,8,9,10,11
+),
+
+ibp_fc as (
+SELECT
+    a.date_order,
+    a.days_of_month,
+    a.days,
+    a.week_number,
+    a.month_number,
+    a.month_name,
+    a.year,
+    a.date_type,
+    a.warehouse_area,
+    a.warehouse_name,
+    b.segmentation as segmentation,
+    sum(total_order) as total_order,
+    sum(total_qty) as total_qty
+FROM
+    ibp_fc0 a
+left join
+    tenant_segmentation b on a.warehouse_area = b.warehouse_area and a.tenant_name = b.tenant_name
+group by
+    1,2,3,4,5,6,7,8,9,10,segmentation
+),
+
+ds_fc0 as (
+SELECT
+    date(date_key) as date_order,
+    EXTRACT(DAY FROM date_key) AS days_of_month,
+    FORMAT_DATE('%A', date_key) AS days,
+    EXTRACT(WEEK FROM date_key) AS week_number,
+    EXTRACT(MONTH FROM date_key) AS month_number,
+    FORMAT_DATE('%B', DATE(date_key)) AS month_name,
+    extract(year from date_key) AS year,
+    CASE
+        WHEN EXTRACT(DAY FROM date_key) = EXTRACT(MONTH FROM date_key) THEN 'DD'
+        WHEN EXTRACT(DAY FROM date_key) IN (25) THEN 'WIB'
+        WHEN EXTRACT(DAY FROM date_key) IN (26,27,28,29,30,31) THEN 'WIB2'
+        ELSE 'N'
+    END AS date_type,
+    CASE
+        WHEN transformed_warehouse LIKE '%Bandung%' THEN 'Bandung'
+        WHEN transformed_warehouse LIKE '%Medan%' THEN 'Medan'
+        WHEN transformed_warehouse LIKE '%Osowilangun%' THEN 'Surabaya'
+        WHEN transformed_warehouse LIKE '%Logos%' OR transformed_warehouse LIKE '%Jakarta%' OR transformed_warehouse LIKE '%Cawang%' OR transformed_warehouse LIKE '%Cilincing%' THEN 'Jabodetabek'
+        END AS warehouse_area,
+    transformed_warehouse as warehouse_name,
+    tenant_name,
+    sum(forecast_non_campaign_orders + forecast_campaign_orders) as total_order,
+    sum(forecast_campaign_basket_size + forecast_non_campaign_basket_size) as total_qty
+FROM
+    `gtl-prod-data-central.sandbox_ibp.manpower_fc_per_wh`
+group by
+    1,2,3,4,5,6,7,8,9,10,11
+),
+
+ds_fc as (
+SELECT
+    a.date_order,
+    a.days_of_month,
+    a.days,
+    a.week_number,
+    a.month_number,
+    a.month_name,
+    a.year,
+    a.date_type,
+    a.warehouse_area,
+    a.warehouse_name,
+    b.segmentation as segmentation,
+    sum(total_order) as total_order,
+    sum(total_qty) as total_qty
+FROM
+    ds_fc0 a
+left join
+    tenant_segmentation b on a.warehouse_area = b.warehouse_area and a.tenant_name = b.tenant_name
+group by
+    1,2,3,4,5,6,7,8,9,10,segmentation
+),
+
+td_fc0 as(
+SELECT
+    DATE(date_order) AS date_order,
+    EXTRACT(DAY FROM PARSE_DATE('%Y-%m-%d', date_order)) AS days_of_month,
+    FORMAT_DATE('%A', PARSE_DATE('%Y-%m-%d', date_order)) AS days,
+    EXTRACT(WEEK FROM PARSE_DATE('%Y-%m-%d', date_order)) AS week_number,
+    EXTRACT(MONTH FROM PARSE_DATE('%Y-%m-%d', date_order)) AS month_number,
+    FORMAT_DATE('%B', DATE(date_order)) AS month_name,
+    extract(year from PARSE_DATE('%Y-%m-%d', date_order)) AS year,
+    CASE
+        WHEN EXTRACT(DAY FROM PARSE_DATE('%Y-%m-%d', date_order)) = EXTRACT(MONTH FROM PARSE_DATE('%Y-%m-%d', date_order)) THEN 'DD'
+        WHEN EXTRACT(DAY FROM PARSE_DATE('%Y-%m-%d', date_order)) IN (25) THEN 'WIB'
+        WHEN EXTRACT(DAY FROM PARSE_DATE('%Y-%m-%d', date_order)) IN (26,27,28,29,30,31) THEN 'WIB2'
+        ELSE 'N'
+    END AS date_type,
+    CASE
+        WHEN warehouse_name LIKE '%Bandung%' THEN 'Bandung'
+        WHEN warehouse_name LIKE '%Medan%' THEN 'Medan'
+        WHEN warehouse_name LIKE '%Osowilangun%' THEN 'Surabaya'
+        WHEN warehouse_name LIKE '%Logos%' OR warehouse_name LIKE '%Jakarta%' OR warehouse_name LIKE '%Cawang%' OR warehouse_name LIKE '%Cilincing%' or warehouse_name like '%Metro%' THEN 'Jabodetabek'
+        END AS warehouse_area,
+        warehouse_name,
+        tenant_name,
+        sum(proportionated_forecast_qty) as total_qty,
+        sum(proportionated_forecast_order) as total_order
+FROM
+    `gtl-prod-data-central.sandbox_ibp.pbi_manpower_td_fc`
+group by
+    1,2,3,4,5,6,7,8,9,10,11
+),
+
+td_fc as(
+SELECT
+    a.date_order,
+    a.days_of_month,
+    a.days,
+    a.week_number,
+    a.month_number,
+    a.month_name,
+    a.year,
+    a.date_type,
+    a.warehouse_area,
+    a.warehouse_name,
+    b.segmentation as segmentation,
+    sum(a.total_qty) as total_qty,
+    sum(a.total_order) as total_order
+FROM
+    td_fc0 a
+left join
+    tenant_segmentation b on a.warehouse_area = b.warehouse_area and a.tenant_name = b.tenant_name
+group by
+    1,2,3,4,5,6,7,8,9,10,segmentation
+),
+
+df0 as(
+SELECT
+    date(unallocated_dttm) as date_order,
+    EXTRACT(DAY FROM unallocated_dttm) AS days_of_month,
+    FORMAT_DATE('%A', unallocated_dttm) AS days,
+    EXTRACT(WEEK FROM unallocated_dttm) AS week_number,
+    EXTRACT(MONTH FROM unallocated_dttm) AS month_number,
+    FORMAT_DATE('%B', DATE(unallocated_dttm)) AS month_name,
+    extract(year from unallocated_dttm) AS year,
+    CASE
+        WHEN EXTRACT(DAY FROM unallocated_dttm) = EXTRACT(MONTH FROM unallocated_dttm) THEN 'DD'
+        WHEN EXTRACT(DAY FROM unallocated_dttm) IN (25) THEN 'WIB'
+        WHEN EXTRACT(DAY FROM unallocated_dttm) IN (26,27,28,29,30,31) THEN 'WIB2'
+        ELSE 'N'
+    END AS date_type,
+    CASE
+        WHEN warehouse_name LIKE '%Bandung%' THEN 'Bandung'
+        WHEN warehouse_name LIKE '%Medan%' THEN 'Medan'
+        WHEN warehouse_name LIKE '%Osowilangun%' THEN 'Surabaya'
+        WHEN warehouse_name LIKE '%Logos%' OR warehouse_name LIKE '%Jakarta%' OR warehouse_name LIKE '%Cawang%' OR warehouse_name LIKE '%Cilincing%' or warehouse_name like '%Metro%' THEN 'Jabodetabek'
+        END AS warehouse_area,
+    CASE WHEN warehouse_name = 'Bandung Nasution Warehouse' THEN 'Bandung Warehouse' ELSE warehouse_name END AS warehouse_name,
+    tenant_name,
+    COUNT(DISTINCT outbound_number) AS total_order,
+    SUM(basket_size) AS total_qty
+FROM
+    `production-data-245d.derived.order_remaining_time`
+WHERE
+    DATE(unallocated_dttm) >= '2023-09-01'
+    AND tenant_name NOT LIKE '%Tokonow%'
+    AND tenant_name NOT LIKE '%SWIFT%'
+    AND tenant_name NOT LIKE '%2ndmile%'
+    AND tenant_name NOT LIKE '%Crossdock%'
+    AND tenant_name NOT LIKE '%Consumable%'
+    and outbound_class NOT LIKE '%b2b%'
+    and outbound_status NOT IN ('cancelled')
+    and waybill_number not like '%WSN%'
+group by 1,2,3,4,5,6,7,8,9,10,11
+),
+
+df1 as(
+SELECT
+    a.date_order,
+    a.days_of_month,
+    a.days,
+    a.week_number,
+    a.month_number,
+    a.month_name,
+    a.year,
+    a.date_type,
+    a.warehouse_area,
+    a.warehouse_name,
+    b.segmentation as segmentation,
+    sum(total_order) as total_order,
+    sum(total_qty) AS total_qty
+FROM
+    df0 a
+left join
+    tenant_segmentation b on a.warehouse_area=b.warehouse_area and a.tenant_name = b.tenant_name
+group by 1,2,3,4,5,6,7,8,9,10,11
+),
+
+df3 as(
+SELECT
+    a.date_order,
+    EXTRACT(DAY FROM a.date_order) AS days_of_month,
+    FORMAT_DATE('%A', a.date_order) AS days,
+    EXTRACT(WEEK FROM a.date_order) AS week_number,
+    EXTRACT(MONTH FROM a.date_order) AS month_number,
+    FORMAT_DATE('%B', DATE(a.date_order)) AS month_name,
+    extract(year from a.date_order) AS year,
+    CASE
+        WHEN EXTRACT(DAY FROM a.date_order) = EXTRACT(MONTH FROM a.date_order) THEN 'DD'
+        WHEN EXTRACT(DAY FROM a.date_order) IN (25) THEN 'WIB'
+        WHEN EXTRACT(DAY FROM a.date_order) IN (26,27,28,29,30,31) THEN 'WIB2'
+        ELSE 'N'
+    END AS date_type,
+    a.warehouse_area,
+    a.warehouse_name,
+    d.segmentation,
+    null as total_order,
+    null as total_qty,
+    a.total_order as fc_ds_order,
+    a.total_qty as fc_ds_qty,
+    b.total_order as fc_ibp_order,
+    b.total_qty as fc_ibp_qty,
+    c.total_order as fc_td_order,
+    c.total_qty as fc_td_qty,
+    null as lw1_order,
+    null as lw1_qty,
+    null as lw2_order,
+    null as lw2_qty,
+    null as lw3_order,
+    null as lw3_qty,
+    null as lm1_order,
+    null as lm1_qty,
+    null as lm2_order,
+    null as lm2_qty,
+    null as lm3_order,
+    null as lm3_qty
+FROM
+    ds_fc a
+left join
+    ibp_fc b on a.date_order = b.date_order and a.warehouse_area = b.warehouse_area and a.warehouse_name = b.warehouse_name and a.segmentation = b.segmentation
+left join
+    td_fc c on a.date_order = c.date_order and a.warehouse_area = c.warehouse_area and a.warehouse_name = c.warehouse_name and a.segmentation = c.segmentation
+left join
+    tenant_segmentation d on a.warehouse_area = d.warehouse_area and a.segmentation = d.segmentation
+)
+
+SELECT
+    a.date_order,
+    a.days_of_month,
+    a.days,
+    a.week_number,
+    a.month_number,
+    a.month_name,
+    a.year,
+    a.date_type,
+    a.warehouse_area,
+    a.warehouse_name,
+    case
+        when a.segmentation is not null then a.segmentation
+        else 'NE'
+    end as segmentation,
+    avg(a.total_order) as total_order,
+    avg(a.total_qty)as total_qty,
+    avg(h.total_order) as fc_ds_order,
+    avg(h.total_qty) as fc_ds_qty,
+    avg(i.total_order) as fc_ibp_order,
+    avg(i.total_qty) as fc_ibp_qty,
+    avg(j.total_order) as fc_td_order,
+    avg(j.total_qty) as fc_td_qty,
+    avg(b.total_order) as lw1_order,
+    avg(b.total_qty) as lw1_qty,
+    avg(c.total_order) as lw2_order,
+    avg(c.total_qty) as lw2_qty,
+    avg(d.total_order) as lw3_order,
+    avg(d.total_qty) as lw3_qty,
+    avg(e.total_order) as lm1_order,
+    avg(e.total_qty) as lm1_qty,
+    avg(f.total_order) as lm2_order,
+    avg(f.total_qty) as lm2_qty,
+    avg(g.total_order) as lm3_order,
+    avg(g.total_qty) as lm3_qty,
+    TIMESTAMP_ADD(CURRENT_TIMESTAMP() , INTERVAL 7 HOUR) as processed_dttm
+FROM
+    df1 a
+LEFT JOIN
+    df1 b ON a.warehouse_name = b.warehouse_name
+    AND a.days = b.days
+    AND a.week_number - 1 = b.week_number
+    AND a.segmentation = b.segmentation
+LEFT JOIN
+    df1 c ON a.warehouse_name = c.warehouse_name
+    AND a.days = c.days
+    AND a.week_number - 2 = c.week_number
+    AND a.segmentation = c.segmentation
+LEFT JOIN
+    df1 d ON a.warehouse_name = d.warehouse_name
+    AND a.days = d.days
+    AND a.week_number - 3 = d.week_number
+    AND a.segmentation = d.segmentation
+LEFT JOIN
+    df1 e ON a.warehouse_name = e.warehouse_name
+    AND a.days_of_month = e.days_of_month
+    AND a.month_number - 1 = e.month_number
+    AND a.segmentation = e.segmentation
+LEFT JOIN
+    df1 f ON a.warehouse_name = f.warehouse_name
+    AND a.days_of_month = f.days_of_month
+    AND a.month_number - 2 = f.month_number
+    AND a.segmentation = f.segmentation
+LEFT JOIN
+    df1 g ON a.warehouse_name = g.warehouse_name
+    AND a.days_of_month = g.days_of_month
+    AND a.month_number - 3 = g.month_number
+    AND a.segmentation = g.segmentation
+LEFT JOIN
+    ds_fc h on a.warehouse_name = h.warehouse_name
+    and a.date_order = h.date_order
+    and a.segmentation = h.segmentation
+LEFT JOIN
+    ibp_fc i on a.warehouse_name = i.warehouse_name
+    and a.date_order = i.date_order
+    and a.segmentation = i.segmentation
+LEFT JOIN
+    td_fc j on a.warehouse_name = j.warehouse_name
+    and a.date_order = j.date_order
+    and a.segmentation = j.segmentation
+left join
+    tenant_segmentation k on a.warehouse_area = k.warehouse_area and a.segmentation = k.segmentation
+WHERE
+    a.date_order <= DATE(current_date)
+group by 1,2,3,4,5,6,7,8,9,10,11
+UNION ALL
+select
+    date_order,
+    days_of_month,
+    days,
+    week_number,
+    month_number,
+    month_name,
+    year,
+    date_type,
+    warehouse_area,
+    warehouse_name,
+    case
+        when segmentation is not null then segmentation
+        else 'NE'
+    end as segmentation,
+    avg(total_order) as total_order,
+    avg(total_qty) as total_qty,
+    avg(fc_ds_order) as fc_ds_order,
+    avg(fc_ds_qty) as fc_ds_qty,
+    avg(fc_ibp_order) as fc_ibp_order,
+    avg(fc_ibp_qty) as fc_ibp_qty,
+    avg(fc_td_order) as fc_td_order,
+    avg(fc_td_qty) as fc_td_qty,
+    avg(lw1_order) as lw1_order,
+    avg(lw1_qty) as lw1_qty,
+    avg(lw2_order) as lw2_order,
+    avg(lw2_qty) as lw2_qty,
+    avg(lw3_order) as lw3_order,
+    avg(lw3_qty) as lw3_qty,
+    avg(lm1_order) as lm1_order,
+    avg(lm1_order) as lm1_order,
+    avg(lm2_order) as lm2_order,
+    avg(lm2_qty) as lm2_qty,
+    avg(lm3_order) as lm3_order,
+    avg(lm3_qty) as lm3_qty,
+    TIMESTAMP_ADD(CURRENT_TIMESTAMP() , INTERVAL 7 HOUR) as processed_dttm
+from
+    df3
+where
+    date_order > date(current_date)
+group by
+    1,2,3,4,5,6,7,8,9,10,11

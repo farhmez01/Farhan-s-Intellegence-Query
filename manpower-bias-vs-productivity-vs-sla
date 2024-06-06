@@ -1,0 +1,43 @@
+with temp_table AS(
+SELECT
+  activity_area,
+  warehouse_location AS warehouse_name,
+  DATE(date) as date,
+  plan,
+  actual,
+  bias
+FROM
+  `production-data-245d.google_sheet_collection.plan_actual_dw_v1`
+  ),
+
+combined_data AS (
+  SELECT
+    temp_table.date,
+    a.warehouse_name,
+    bias,
+    a.productivity,
+    CAST(REGEXP_REPLACE(b.sla, r'%', '') AS FLOAT64) AS sla_value
+  FROM
+    temp_table
+  JOIN
+    `production-data-245d.ibp_denny.all_division_productivity` a
+  ON
+    temp_table.date = a.date
+    AND temp_table.warehouse_name = a.warehouse_name
+  JOIN
+    `production-data-245d.outbound.outbound_daily_routed_v1`b
+  ON
+    temp_table.date = b.date
+    AND temp_table.warehouse_name = b.warehouse_name
+  WHERE
+    temp_table.activity_area = 'overall'
+)
+
+SELECT
+  date,
+  warehouse_name,
+  bias,
+  productivity,
+  sla_value
+FROM
+  combined_data;

@@ -1,0 +1,12 @@
+SELECT
+  distinct(product_name),
+  TRIM(REGEXP_EXTRACT(REGEXP_REPLACE(REGEXP_REPLACE(product_name, r'\[.*?\]', ''), r'\(.*?\)', ''), r'[\]\)\s]*(\S+\s+\S+)')) AS sub_brand
+FROM
+  `production-data-245d.bi_outbound_marts.fpna_outbound`
+where
+  tenant_name NOT LIKE '%Tokonow%'
+  and tenant_name = 'TC - DDI Unicharm'
+  AND tenant_name NOT LIKE '%SWIFT%'
+  AND tenant_name NOT LIKE '%2ndmile%'
+  AND tenant_name NOT LIKE '%Crossdock%'
+  AND tenant_name NOT LIKE '%Consumables%'

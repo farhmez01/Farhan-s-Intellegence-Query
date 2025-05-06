@@ -1,0 +1,74 @@
+SELECT datetime_trunc(datetime(`source`.`pending_dttm`), day) AS `pending_dttm`, (CAST(sum(CASE WHEN `source`.`meet_status` = TRUE THEN 1 ELSE 0.0 END) AS float64) / CASE WHEN count(*) = 0 THEN NULL ELSE count(*) END) AS `sla`
+FROM (WITH
+  p0 AS (
+  SELECT
+    *,
+    CASE
+      WHEN unallocated_dttm IS NULL THEN NULL
+      WHEN DATE(unallocated_dttm) < '2023-10-18'
+  
+  
+   AND ops_target_completion_time >= finished_dttm THEN 'meet_sla'
+      WHEN DATE(unallocated_dttm) < '2023-10-18' AND ops_target_completion_time < finished_dttm THEN 'out_sla'
+      WHEN DATE(unallocated_dttm) < '2023-10-18' AND finished_dttm IS NULL AND ops_target_completion_time >= TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 7 hour) THEN 'meet_sla'
+      WHEN DATE(unallocated_dttm) < '2023-10-18' AND finished_dttm IS NULL AND ops_target_completion_time < TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 7 hour) THEN 'out_sla'
+      WHEN ops_target_completion_time >= in_transit_dttm THEN 'meet_sla'
+      WHEN ops_target_completion_time < in_transit_dttm THEN 'out_sla'
+      WHEN in_transit_dttm IS NULL AND ops_target_completion_time >= TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 7 hour) THEN 'meet_sla'
+      WHEN in_transit_dttm IS NULL AND ops_target_completion_time < TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 7 hour) THEN 'out_sla'
+  END
+    AS sla_status,
+    CASE
+      WHEN unallocated_dttm IS NULL THEN NULL
+      WHEN DATE(unallocated_dttm) < '2023-10-18' AND ops_target_completion_time >= finished_dttm THEN TRUE
+      WHEN DATE(unallocated_dttm) < '2023-10-18' AND ops_target_completion_time < finished_dttm THEN FALSE
+      WHEN DATE(unallocated_dttm) < '2023-10-18' AND finished_dttm IS NULL AND ops_target_completion_time >= TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 7 hour) THEN TRUE
+      WHEN DATE(unallocated_dttm) < '2023-10-18' AND finished_dttm IS NULL AND ops_target_completion_time < TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 7 hour) THEN FALSE
+      WHEN ops_target_completion_time >= in_transit_dttm THEN TRUE
+      WHEN ops_target_completion_time < in_transit_dttm THEN FALSE
+      WHEN in_transit_dttm IS NULL
+    AND ops_target_completion_time >= TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 7 hour) THEN TRUE
+      WHEN in_transit_dttm IS NULL AND ops_target_completion_time < TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 7 hour) THEN FALSE
+  END
+    AS meet_status,
+    CASE
+      WHEN DATE(unallocated_dttm) < '2023-10-18' THEN ROUND(SAFE_DIVIDE(TIMESTAMP_DIFF(finished_dttm,unallocated_dttm,second),3600),2)
+      ELSE ROUND(SAFE_DIVIDE(TIMESTAMP_DIFF(in_transit_dttm,unallocated_dttm,second),3600),2) END AS lead_time
+ 
+FROM
+    `metabase-outbound-sla-7abf.bi_metabase.order_remaining_time`
+ 
+WHERE
+    1=1
+    AND LOWER(warehouse_name) NOT LIKE '%tokonow%'
+    AND outbound_status NOT IN ('cancelled'))
+SELECT
+  warehouse_name,
+  tenant_name,
+  * except(warehouse_name,tenant_name),
+  ROUND(PERCENTILE_CONT(lead_time, 0.95 IGNORE NULLS) OVER(PARTITION BY order_priority, DATE(unallocated_dttm)),2) lead_time_p95_order_priority,
+  CASE WHEN outbound_class LIKE 'b2b%' THEN NULL ELSE "No" END AS b2b_flag,
+  ROUND(SAFE_DIVIDE(TIMESTAMP_DIFF(ops_target_completion_time,unallocated_dttm,second),3600),2) ops_target_lead_time,
+  DATE(unallocated_dttm) unallocated_date,
+  DATE_TRUNC(DATE(unallocated_dttm), WEEK(MONDAY)) unallocated_date_week,
+  
+  CASE
+      WHEN EXTRACT(time FROM in_transit_dttm) BETWEEN '00:00:00' AND '06:59:59.99' THEN EXTRACT (date FROM in_transit_dttm) - 1
+    ELSE
+    EXTRACT (date
+    FROM
+      in_transit_dttm)
+  END
+    shift_date_intransit,
+    CASE
+      WHEN EXTRACT(time FROM in_transit_dttm) BETWEEN '07:00:00' AND '14:59:59.99' THEN '1'
+      WHEN EXTRACT(time FROM in_transit_dttm) BETWEEN '15:00:00' AND '22:59:59.99' THEN '2'
+    ELSE
+    '3'
+  END
+    AS shift,
+FROM
+  p0) `source` WHERE (`source`.`sla_status` IS NOT NULL AND (`source`.`sla_status` <> ''
+    OR `source`.`sla_status` IS NULL) AND `source`.`pending_dttm` >= timestamp_trunc(timestamp_add(current_timestamp(), INTERVAL -7 day), day) AND `source`.`pending_dttm` < timestamp_trunc(timestamp_add(current_timestamp(), INTERVAL 1 day), day) AND `source`.`tenant_name` = 'TC - Wings Official Store' AND `source`.`b2b_flag` = 'No')
+GROUP BY `pending_dttm`
+ORDER BY `pending_dttm` ASC

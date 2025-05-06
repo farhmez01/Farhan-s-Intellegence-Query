@@ -1,0 +1,331 @@
+--QUESTION ID: 2601
+WITH
+
+stock_and_sales AS (
+SELECT
+    alldt_single.date_position closing_date,
+    alldt_single.ibp_tenant_code,
+    alldt_single.tenant_name,
+    alldt_single.warehouse_name,
+    alldt_single.product_sku sku_variant,
+    alldt_single.product_name,
+    alldt_single.segmentation,
+    alldt_single.active_status active,
+    alldt_single.is_discontinued isDiscontinued,
+    alldt_single.available_stock_pcs stock_qty,
+    GREATEST(max_run_rate,0.01) max_avg_sales,
+    alldt_single.avg_sales_l7d avg_sales_l7d,
+    alldt_single.sold_qty avg_sales_l1d,
+    alldt_single.ath_sales_l60d,
+    cogs,
+    CASE
+      WHEN available_stock_pcs > 0 AND max_run_rate <= 0 THEN SAFE_DIVIDE(available_stock_pcs, GREATEST(max_run_rate,0.01))
+      ELSE COALESCE(doi_max_run_rate,0)
+    END AS current_doi_max_avg
+FROM
+    `production-data-245d.sandbox_ibp.ft_1p_single_stock_and_sales_extended` alldt_single
+WHERE
+    alldt_single.date_position = CURRENT_DATE('Asia/Jakarta') - 1
+    AND LOWER(sku_type) <> 'gift'
+    AND LOWER(active_status) = 'active'
+    AND LOWER(is_discontinued) = 'false'
+    AND NOT (ibp_tenant_code = 'MERL' AND warehouse_name = 'Logos Warehouse')
+    AND NOT (ibp_tenant_code = 'TTEV' AND warehouse_name = 'Cilincing Warehouse')
+),
+
+reorder AS (
+SELECT
+    request_date,
+    sku_variant,
+    qty_order_in_pcs rr_qty,
+    req_delivery_date rdd,
+    warehouse_destination warehouse_name,
+    po_number,
+    create_po_date,
+    rr_identifier,
+    requester_name,
+    smt.alias shop
+FROM
+    `gtl-prod-data-central.datamart.st_derived_ibp_reordersheet` rst
+    LEFT JOIN `production-data-245d.datalake_gst_physical.gst_1p_shop_master` smt
+      ON rst.tenant_code = smt.ibp_tenant_code
+WHERE
+    smt.ibp_tenant_code IS NOT NULL
+    AND (LOWER(rr_remarks) NOT LIKE '%cancel%' OR rr_remarks IS NULL)
+),
+
+pre_docking AS (
+SELECT
+    date docking_date,
+    po_number,
+    warehouse_name
+FROM
+    `gtl-prod-data-central.datamart.ft_docking_schedule_derived`
+QUALIFY ROW_NUMBER() OVER(PARTITION BY po_number ORDER BY date DESC)=1
+),
+
+docking AS (
+SELECT
+    docking_date,
+    po_number,
+    warehouse_name
+FROM (
+    -- SELECT
+    --     docking_date,
+    --     po_number,
+    --     warehouse_name,
+    --     1 prio
+    -- FROM
+    --     pre_docking
+    
+    -- UNION ALL
+    
+    SELECT
+        confirmed_docking_date docking_date,
+        po_number,
+        warehouse_name,
+        2 prio
+    FROM
+        `production-data-245d.datalake_gst_physical.gst_1p_dtc_inbound_planning`
+    
+    )
+QUALIFY ROW_NUMBER() OVER(PARTITION BY po_number ORDER BY prio ASC)=1
+),
+
+inbound_status AS (
+SELECT
+    tenant_name,
+    warehouse_name,
+    inbound_instruction_number po_number,
+    inbound_instruction_status,
+    receiving_status,
+    product_sku,
+    quantity po_qty,
+    received_available_quantity receive_qty,
+    putaway_available_quantity putaway_qty,
+    jkt_created_timestamp,
+    jkt_it_created_timestamp,
+    jkt_updated_timestamp,
+FROM
+    `gtl-prod-data-central.datawarehouse.ft_inbound_instruction_line_core`
+),
+
+sla AS (
+SELECT
+    product_sku,
+    inbound_instruction_number,
+    COALESCE(CEILING(SAFE_DIVIDE(sla_hour,24)),0) sla_days
+FROM
+    `production-data-245d.bi_inbound_marts.inbound_monitoring`
+WHERE
+    product_sku IS NOT NULL
+QUALIFY ROW_NUMBER() OVER(PARTITION BY product_sku ORDER BY jkt_it_created_at DESC)=1
+),
+
+p0 AS (
+SELECT
+    rr.requester_name,
+    rr.shop,
+    rr.sku_variant,
+    rr.warehouse_name,
+    rr.rr_identifier,
+    rr.po_number,
+    inbound_instruction_status wms_po_status,
+    CAST(COALESCE(sla_days,1) AS INT64) sla_days,
+    rr.request_date,
+    rr.rdd,
+    DATE(inb.jkt_created_timestamp) wms_po_upload_date,
+    dk.docking_date,
+    DATE(inb.jkt_it_created_timestamp) arrival_date,
+    DATE(inb.jkt_updated_timestamp) last_update,
+    COALESCE(
+      DATE_ADD(DATE(inb.jkt_it_created_timestamp),INTERVAL CAST(COALESCE(sla_days,1) AS INT64) DAY),
+      DATE_ADD(dk.docking_date,INTERVAL CAST(COALESCE(sla_days,1) AS INT64) DAY)) expected_live_date,
+    rr.rr_qty,
+    inb.po_qty,
+    inb.receive_qty,
+    inb.putaway_qty,
+    inb.po_qty - inb.putaway_qty remaining_qty,
+    inb.receive_qty - inb.putaway_qty remaining_put_qty
+FROM
+    reorder rr
+    LEFT JOIN inbound_status inb
+      ON rr.po_number = inb.po_number
+      AND rr.sku_variant = inb.product_sku
+    LEFT JOIN docking dk
+      ON rr.po_number = dk.po_number
+    LEFT JOIN sla
+      ON rr.sku_variant = sla.product_sku
+
+UNION ALL
+
+SELECT
+    'Reallocation' AS requester_name,
+    shm.alias shop,
+    wht.product_sku sku_variant,
+    wht.des_wh warehouse_name,
+    'Reallocation' AS rr_identifier,
+    WHT_des_asn_number po_number,
+    WHT_des_asn_status wms_po_status,
+    NULL AS sla_days,
+    wht.wht_created_date AS request_date,
+    CASE
+      WHEN DATE(TIMESTAMP_ADD(delivered_dttm, INTERVAL 7 HOUR)) >= CURRENT_DATE('Asia/Jakarta') THEN CURRENT_DATE('Asia/Jakarta')
+      WHEN wht.des_wh = 'Osowilangun Warehouse' AND manifest_created_dttm IS NOT NULL THEN DATE(DATE_ADD(TIMESTAMP_ADD(manifest_created_dttm, INTERVAL 7 HOUR), INTERVAL 4 DAY))
+      WHEN wht.des_wh = 'Medan Warehouse' AND manifest_created_dttm IS NOT NULL THEN DATE(DATE_ADD(TIMESTAMP_ADD(manifest_created_dttm, INTERVAL 7 HOUR), INTERVAL 10 DAY))
+      WHEN wht.des_wh = 'Logos Warehouse' AND manifest_created_dttm IS NOT NULL THEN DATE(DATE_ADD(TIMESTAMP_ADD(manifest_created_dttm, INTERVAL 7 HOUR), INTERVAL 2 DAY))
+      WHEN wht.des_wh = 'Osowilangun Warehouse' AND manifest_created_dttm IS NULL THEN DATE(DATE_ADD(wht_created_date, INTERVAL 7 DAY))
+      WHEN wht.des_wh = 'Medan Warehouse' AND manifest_created_dttm IS NULL THEN DATE(DATE_ADD(wht_created_date, INTERVAL 10 DAY))
+    ELSE DATE_ADD(wht_created_date, INTERVAL 7 DAY) END AS rdd,
+    wht.wht_created_date AS wms_po_upload_date,
+    DATE(manifest_created_dttm) AS docking_date,
+    DATE(manifest_updated_dttm) AS arrival_date,
+    DATE(delivered_dttm) AS last_update,
+    CASE
+      WHEN DATE(TIMESTAMP_ADD(delivered_dttm, INTERVAL 7 HOUR)) >= CURRENT_DATE('Asia/Jakarta') THEN CURRENT_DATE('Asia/Jakarta')
+      WHEN wht.des_wh = 'Osowilangun Warehouse' AND manifest_created_dttm IS NOT NULL THEN DATE(DATE_ADD(TIMESTAMP_ADD(manifest_created_dttm, INTERVAL 7 HOUR), INTERVAL 4 DAY))
+      WHEN wht.des_wh = 'Medan Warehouse' AND manifest_created_dttm IS NOT NULL THEN DATE(DATE_ADD(TIMESTAMP_ADD(manifest_created_dttm, INTERVAL 7 HOUR), INTERVAL 10 DAY))
+      WHEN wht.des_wh = 'Logos Warehouse' AND manifest_created_dttm IS NOT NULL THEN DATE(DATE_ADD(TIMESTAMP_ADD(manifest_created_dttm, INTERVAL 7 HOUR), INTERVAL 2 DAY))
+      WHEN wht.des_wh = 'Osowilangun Warehouse' AND manifest_created_dttm IS NULL THEN DATE(DATE_ADD(wht_created_date, INTERVAL 7 DAY))
+      WHEN wht.des_wh = 'Medan Warehouse' AND manifest_created_dttm IS NULL THEN DATE(DATE_ADD(wht_created_date, INTERVAL 10 DAY))
+    ELSE DATE_ADD(wht_created_date, INTERVAL 7 DAY) END AS expected_live_date,
+    WHT_checked_wsnpckg_qty rr_qty,
+    WHT_des_asn_qty po_qty,
+    WHT_des_asn_qty receive_qty,
+    WHT_des_available_putaway_qty putaway_qty,
+    SUM(CASE
+      WHEN wht_des_asn_status IS NULL OR wht_des_asn_status IN ('scheduled','receiving_completed') THEN WHT_checked_wsnpckg_qty
+      WHEN wht_des_asn_status = 'putaway' AND DATE(TIMESTAMP_ADD(delivered_dttm, INTERVAL 7 HOUR)) >= CURRENT_DATE('Asia/Jakarta') THEN COALESCE(WHT_des_asn_qty, WHT_checked_wsnpckg_qty)
+      WHEN wht_des_asn_status = 'putaway_completed' AND DATE(TIMESTAMP_ADD(delivered_dttm, INTERVAL 7 HOUR)) >= CURRENT_DATE('Asia/Jakarta') THEN WHT_des_available_putaway_qty
+    ELSE 0 END) remaining_qty,
+    SUM(CASE
+      WHEN wht_des_asn_status IS NULL OR wht_des_asn_status IN ('scheduled','receiving_completed') THEN WHT_checked_wsnpckg_qty
+      WHEN wht_des_asn_status = 'putaway' AND DATE(TIMESTAMP_ADD(delivered_dttm, INTERVAL 7 HOUR)) >= CURRENT_DATE('Asia/Jakarta') THEN COALESCE(WHT_des_asn_qty, WHT_checked_wsnpckg_qty)
+      WHEN wht_des_asn_status = 'putaway_completed' AND DATE(TIMESTAMP_ADD(delivered_dttm, INTERVAL 7 HOUR)) >= CURRENT_DATE('Asia/Jakarta') THEN WHT_des_available_putaway_qty
+    ELSE 0 END) remaining_put_qty
+FROM
+  `gtl-prod-data-central.datawarehouse.ft_warehouse_transfer_non_secondmile` wht
+  LEFT JOIN `gtl-prod-data-central.datawarehouse.dt_tenant_core` dttc
+    ON wht.tenant_name = dttc.name
+  LEFT JOIN `production-data-245d.datalake_gst_physical.gst_1p_shop_master` shm
+    ON dttc.id = shm.wms_tenant_id
+WHERE
+  shm.wms_tenant_id IS NOT NULL
+  AND wht_created_date >= CURRENT_DATE('Asia/Jakarta') - 30
+GROUP BY 1,2,3,4,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19
+QUALIFY ROW_NUMBER() OVER (PARTITION BY wht_created_date, sku_variant, warehouse_name ORDER BY shm.alias DESC) = 1
+),
+
+p1 AS (
+SELECT
+    sku_variant,
+    warehouse_name,
+    shop,
+    SUM(CASE
+          WHEN (wms_po_status IS NULL OR wms_po_status = 'scheduled' OR wms_po_status = 'pending') AND expected_live_date = CURRENT_DATE('Asia/Jakarta')
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS inb_d0,
+    SUM(CASE
+          WHEN (wms_po_status IS NULL OR wms_po_status = 'scheduled' OR wms_po_status = 'pending') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') + 1
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS inb_d1,
+    SUM(CASE
+          WHEN (wms_po_status IS NULL OR wms_po_status = 'scheduled' OR wms_po_status = 'pending') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') + 2
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS inb_d2,
+    SUM(CASE
+          WHEN (wms_po_status IS NULL OR wms_po_status = 'scheduled' OR wms_po_status = 'pending') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') + 3
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS inb_d3,
+    SUM(CASE
+          WHEN (wms_po_status IS NULL OR wms_po_status = 'scheduled' OR wms_po_status = 'pending') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') + 4
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS inb_d4,
+    SUM(CASE
+          WHEN (wms_po_status IS NULL OR wms_po_status = 'scheduled' OR wms_po_status = 'pending') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') + 5
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS inb_d5,
+    SUM(CASE
+          WHEN (wms_po_status IS NULL OR wms_po_status = 'scheduled' OR wms_po_status = 'pending') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') + 6
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS inb_d6,
+    SUM(CASE
+          WHEN (wms_po_status IS NULL OR wms_po_status = 'scheduled' OR wms_po_status = 'pending') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') + 7
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS inb_d7,
+    SUM(CASE
+          WHEN (wms_po_status IS NULL OR wms_po_status = 'scheduled' OR wms_po_status = 'pending') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') + 8
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS inb_d8,
+    SUM(CASE
+          WHEN (wms_po_status IS NULL OR wms_po_status = 'scheduled' OR wms_po_status = 'pending') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') + 9
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS inb_d9,
+    SUM(CASE
+          WHEN (wms_po_status IS NULL OR wms_po_status = 'scheduled' OR wms_po_status = 'pending') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') + 10
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS inb_d10,
+    SUM(CASE
+          WHEN (wms_po_status IS NULL OR wms_po_status = 'scheduled' OR wms_po_status = 'pending') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') + 11
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS inb_d11,
+    SUM(CASE
+          WHEN (wms_po_status IS NULL OR wms_po_status = 'scheduled' OR wms_po_status = 'pending') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') + 12
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS inb_d12,
+    SUM(CASE
+          WHEN (wms_po_status IS NULL OR wms_po_status = 'scheduled' OR wms_po_status = 'pending') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') + 13
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS inb_d13,
+    SUM(CASE
+          WHEN (wms_po_status IS NULL OR wms_po_status = 'scheduled' OR wms_po_status = 'pending') AND expected_live_date >= CURRENT_DATE('Asia/Jakarta') + 14
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS inb_d14,
+    SUM(CASE
+          WHEN wms_po_status IN ('receiving','putaway','receiving_completed') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') THEN remaining_put_qty
+          ELSE 0 END) AS remain_d0,
+    SUM(CASE
+          WHEN wms_po_status IN ('receiving','putaway','receiving_completed') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') + 1 THEN remaining_put_qty
+          ELSE 0 END) AS remain_d1,
+    SUM(CASE
+          WHEN wms_po_status IN ('receiving','putaway','receiving_completed') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') + 2 THEN remaining_put_qty
+          ELSE 0 END) AS remain_d2,
+    SUM(CASE
+          WHEN wms_po_status IN ('receiving','putaway','receiving_completed') AND expected_live_date = CURRENT_DATE('Asia/Jakarta') + 3 THEN remaining_put_qty
+          ELSE 0 END) AS remain_d3,
+    SUM(CASE
+          WHEN wms_po_status IN ('putaway','receiving','receiving_completed') AND expected_live_date < CURRENT_DATE('Asia/Jakarta')
+            AND last_update >= CURRENT_DATE('Asia/Jakarta') - 3
+          THEN remaining_qty ELSE 0 END) AS delayed_d0, 
+    SUM(CASE
+          WHEN wms_po_status IN ('rejected','dispute') AND expected_live_date >= CURRENT_DATE('Asia/Jakarta') - 7
+            AND expected_live_date < CURRENT_DATE('Asia/Jakarta')
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS disputed_l7d,
+    SUM(CASE
+          WHEN (wms_po_status IS NULL OR wms_po_status = 'scheduled' OR wms_po_status = 'pending') AND expected_live_date >= CURRENT_DATE('Asia/Jakarta') - 14
+            AND expected_live_date < CURRENT_DATE('Asia/Jakarta')
+          THEN COALESCE(po_qty,rr_qty) ELSE 0 END) AS ftd_l14d                
+FROM
+    p0
+GROUP BY 1,2,3
+)
+
+SELECT
+    sns.* EXCEPT(tenant_name),
+    p1.shop,
+    SAFE_DIVIDE(GREATEST(0,COALESCE(stock_qty,0) + COALESCE(inb_d0,0) + COALESCE(remain_d0,0) - max_avg_sales), max_avg_sales) doi_d1,
+    SAFE_DIVIDE(GREATEST(0,GREATEST(0,COALESCE(stock_qty,0) + COALESCE(inb_d0,0) + COALESCE(remain_d0,0) - max_avg_sales) + COALESCE(inb_d1,0) + COALESCE(remain_d1,0) - max_avg_sales), max_avg_sales) doi_d2,
+    SAFE_DIVIDE(GREATEST(0,GREATEST(0,GREATEST(0,COALESCE(stock_qty,0) + COALESCE(inb_d0,0) + COALESCE(remain_d0,0) - max_avg_sales) + COALESCE(inb_d1,0) + COALESCE(remain_d1,0) - max_avg_sales) + COALESCE(inb_d2,0) + COALESCE(remain_d2,0) - max_avg_sales), max_avg_sales) doi_d3,
+    SAFE_DIVIDE(GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,COALESCE(stock_qty,0) + COALESCE(inb_d0,0) + COALESCE(remain_d0,0) - max_avg_sales) + COALESCE(inb_d1,0) + COALESCE(remain_d1,0) - max_avg_sales) + COALESCE(inb_d2,0) + COALESCE(remain_d2,0) - max_avg_sales) + COALESCE(inb_d3,0) + COALESCE(remain_d3,0) - max_avg_sales), max_avg_sales) doi_d4,
+    SAFE_DIVIDE(GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,COALESCE(stock_qty,0) + COALESCE(inb_d0,0) + COALESCE(remain_d0,0) - max_avg_sales) + COALESCE(inb_d1,0) + COALESCE(remain_d1,0) - max_avg_sales) + COALESCE(inb_d2,0) + COALESCE(remain_d2,0) - max_avg_sales) + COALESCE(inb_d3,0) + COALESCE(remain_d3,0) - max_avg_sales) + COALESCE(inb_d4,0) - max_avg_sales), max_avg_sales) doi_d5,
+    SAFE_DIVIDE(GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,COALESCE(stock_qty,0) + COALESCE(inb_d0,0) + COALESCE(remain_d0,0) - max_avg_sales) + COALESCE(inb_d1,0) + COALESCE(remain_d1,0) - max_avg_sales) + COALESCE(inb_d2,0) + COALESCE(remain_d2,0) - max_avg_sales) + COALESCE(inb_d3,0) + COALESCE(remain_d3,0) - max_avg_sales) + COALESCE(inb_d4,0) - max_avg_sales) + COALESCE(inb_d5,0) - max_avg_sales), max_avg_sales) doi_d6,
+    SAFE_DIVIDE(GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,COALESCE(stock_qty,0) + COALESCE(inb_d0,0) + COALESCE(remain_d0,0) - max_avg_sales) + COALESCE(inb_d1,0) + COALESCE(remain_d1,0) - max_avg_sales) + COALESCE(inb_d2,0) + COALESCE(remain_d2,0) - max_avg_sales) + COALESCE(inb_d3,0) + COALESCE(remain_d3,0) - max_avg_sales) + COALESCE(inb_d4,0) - max_avg_sales) + COALESCE(inb_d5,0) - max_avg_sales) + COALESCE(inb_d6,0) - max_avg_sales), max_avg_sales) doi_d7,
+    SAFE_DIVIDE(GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,COALESCE(stock_qty,0) + COALESCE(inb_d0,0) + COALESCE(remain_d0,0) - max_avg_sales) + COALESCE(inb_d1,0) + COALESCE(remain_d1,0) - max_avg_sales) + COALESCE(inb_d2,0) + COALESCE(remain_d2,0) - max_avg_sales) + COALESCE(inb_d3,0) + COALESCE(remain_d3,0) - max_avg_sales) + COALESCE(inb_d4,0) - max_avg_sales) + COALESCE(inb_d5,0) - max_avg_sales) + COALESCE(inb_d6,0) - max_avg_sales) + COALESCE(inb_d7,0) - max_avg_sales), max_avg_sales) doi_d8,
+    SAFE_DIVIDE(GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,COALESCE(stock_qty,0) + COALESCE(inb_d0,0) + COALESCE(remain_d0,0) - max_avg_sales) + COALESCE(inb_d1,0) + COALESCE(remain_d1,0) - max_avg_sales) + COALESCE(inb_d2,0) + COALESCE(remain_d2,0) - max_avg_sales) + COALESCE(inb_d3,0) + COALESCE(remain_d3,0) - max_avg_sales) + COALESCE(inb_d4,0) - max_avg_sales) + COALESCE(inb_d5,0) - max_avg_sales) + COALESCE(inb_d6,0) - max_avg_sales) + COALESCE(inb_d7,0) - max_avg_sales) + COALESCE(inb_d8,0) - max_avg_sales), max_avg_sales) doi_d9,
+    SAFE_DIVIDE(GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,COALESCE(stock_qty,0) + COALESCE(inb_d0,0) + COALESCE(remain_d0,0) - max_avg_sales) + COALESCE(inb_d1,0) + COALESCE(remain_d1,0) - max_avg_sales) + COALESCE(inb_d2,0) + COALESCE(remain_d2,0) - max_avg_sales) + COALESCE(inb_d3,0) + COALESCE(remain_d3,0) - max_avg_sales) + COALESCE(inb_d4,0) - max_avg_sales) + COALESCE(inb_d5,0) - max_avg_sales) + COALESCE(inb_d6,0) - max_avg_sales) + COALESCE(inb_d7,0) - max_avg_sales) + COALESCE(inb_d8,0) - max_avg_sales) + COALESCE(inb_d9,0) - max_avg_sales), max_avg_sales) doi_d10,
+    SAFE_DIVIDE(GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,COALESCE(stock_qty,0) + COALESCE(inb_d0,0) + COALESCE(remain_d0,0) - max_avg_sales) + COALESCE(inb_d1,0) + COALESCE(remain_d1,0) - max_avg_sales) + COALESCE(inb_d2,0) + COALESCE(remain_d2,0) - max_avg_sales) + COALESCE(inb_d3,0) + COALESCE(remain_d3,0) - max_avg_sales) + COALESCE(inb_d4,0) - max_avg_sales) + COALESCE(inb_d5,0) - max_avg_sales) + COALESCE(inb_d6,0) - max_avg_sales) + COALESCE(inb_d7,0) - max_avg_sales) + COALESCE(inb_d8,0) - max_avg_sales) + COALESCE(inb_d9,0) - max_avg_sales) + COALESCE(inb_d10,0) - max_avg_sales), max_avg_sales) doi_d11,
+    SAFE_DIVIDE(GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,COALESCE(stock_qty,0) + COALESCE(inb_d0,0) + COALESCE(remain_d0,0) - max_avg_sales) + COALESCE(inb_d1,0) + COALESCE(remain_d1,0) - max_avg_sales) + COALESCE(inb_d2,0) + COALESCE(remain_d2,0) - max_avg_sales) + COALESCE(inb_d3,0) + COALESCE(remain_d3,0) - max_avg_sales) + COALESCE(inb_d4,0) - max_avg_sales) + COALESCE(inb_d5,0) - max_avg_sales) + COALESCE(inb_d6,0) - max_avg_sales) + COALESCE(inb_d7,0) - max_avg_sales) + COALESCE(inb_d8,0) - max_avg_sales) + COALESCE(inb_d9,0) - max_avg_sales) + COALESCE(inb_d10,0) - max_avg_sales) + COALESCE(inb_d11,0) - max_avg_sales), max_avg_sales) doi_d12,
+    SAFE_DIVIDE(GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,COALESCE(stock_qty,0) + COALESCE(inb_d0,0) + COALESCE(remain_d0,0) - max_avg_sales) + COALESCE(inb_d1,0) + COALESCE(remain_d1,0) - max_avg_sales) + COALESCE(inb_d2,0) + COALESCE(remain_d2,0) - max_avg_sales) + COALESCE(inb_d3,0) + COALESCE(remain_d3,0) - max_avg_sales) + COALESCE(inb_d4,0) - max_avg_sales) + COALESCE(inb_d5,0) - max_avg_sales) + COALESCE(inb_d6,0) - max_avg_sales) + COALESCE(inb_d7,0) - max_avg_sales) + COALESCE(inb_d8,0) - max_avg_sales) + COALESCE(inb_d9,0) - max_avg_sales) + COALESCE(inb_d10,0) - max_avg_sales) + COALESCE(inb_d11,0) - max_avg_sales) + COALESCE(inb_d12,0) - max_avg_sales), max_avg_sales) doi_d13,
+    SAFE_DIVIDE(GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,COALESCE(stock_qty,0) + COALESCE(inb_d0,0) + COALESCE(remain_d0,0) - max_avg_sales) + COALESCE(inb_d1,0) + COALESCE(remain_d1,0) - max_avg_sales) + COALESCE(inb_d2,0) + COALESCE(remain_d2,0) - max_avg_sales) + COALESCE(inb_d3,0) + COALESCE(remain_d3,0) - max_avg_sales) + COALESCE(inb_d4,0) - max_avg_sales) + COALESCE(inb_d5,0) - max_avg_sales) + COALESCE(inb_d6,0) - max_avg_sales) + COALESCE(inb_d7,0) - max_avg_sales) + COALESCE(inb_d8,0) - max_avg_sales) + COALESCE(inb_d9,0) - max_avg_sales) + COALESCE(inb_d10,0) - max_avg_sales) + COALESCE(inb_d11,0) - max_avg_sales) + COALESCE(inb_d12,0) - max_avg_sales) + COALESCE(inb_d13,0) - max_avg_sales), max_avg_sales) doi_d14,
+    SAFE_DIVIDE(GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,GREATEST(0,COALESCE(stock_qty,0) + COALESCE(inb_d0,0) + COALESCE(remain_d0,0) - max_avg_sales) + COALESCE(inb_d1,0) + COALESCE(remain_d1,0) - max_avg_sales) + COALESCE(inb_d2,0) + COALESCE(remain_d2,0) - max_avg_sales) + COALESCE(inb_d3,0) + COALESCE(remain_d3,0) - max_avg_sales) + COALESCE(inb_d4,0) - max_avg_sales) + COALESCE(inb_d5,0) - max_avg_sales) + COALESCE(inb_d6,0) - max_avg_sales) + COALESCE(inb_d7,0) - max_avg_sales) + COALESCE(inb_d8,0) - max_avg_sales) + COALESCE(inb_d9,0) - max_avg_sales) + COALESCE(inb_d10,0) - max_avg_sales) + COALESCE(inb_d11,0) - max_avg_sales) + COALESCE(inb_d12,0) - max_avg_sales) + COALESCE(inb_d13,0) - max_avg_sales), + COALESCE(inb_d14,0) - max_avg_sales), max_avg_sales) doi_d14beyond,    
+    GREATEST(0,SAFE_DIVIDE(COALESCE(delayed_d0,0), max_avg_sales)) doi_delayed,
+    GREATEST(0,SAFE_DIVIDE(COALESCE(ftd_l14d,0), max_avg_sales)) doi_ftd_l14d,
+    GREATEST(0,SAFE_DIVIDE(COALESCE(disputed_l7d,0), max_avg_sales)) doi_disputed_l7d
+FROM
+    stock_and_sales sns
+    LEFT JOIN p1
+      ON sns.sku_variant = p1.sku_variant
+      AND sns.warehouse_name = p1.warehouse_name
+WHERE
+    1=1
+    [[AND sns.sku_variant = {{sku_variant}}]]
+    [[AND sns.ibp_tenant_code = {{tenant_code}}]]
+    [[AND p1.shop = {{shop}}]]
+    [[AND sns.warehouse_name = {{warehouse_name}}]]
+    [[AND sns.segmentation = {{HYP_Segment}}]]
+ORDER BY sns.avg_sales_l1d DESC

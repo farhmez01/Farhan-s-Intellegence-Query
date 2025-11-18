@@ -1,0 +1,380 @@
+    WITH calendar AS (
+      SELECT
+        DATE('2025-08-01') + INTERVAL x DAY AS date_timestamp
+      FROM
+        UNNEST(GENERATE_ARRAY(0, 90)) x
+    ),
+    
+    stores AS (
+      SELECT
+        store_code
+      FROM
+        UNNEST(
+          [
+      '83502','83503','83504','83505',
+      '83510','83559','83617','83514','83512','83516'
+    ]
+        ) AS store_code
+    ),
+    
+    sku as (
+        SELECT
+  distinct logs.sku AS sku,
+  case when oms.container_name is not null then oms.container_name
+  else mt.description
+  end as description
+FROM
+  `data_pool_real_time.ims_prieds_inventory_logs` logs
+left join `data_pool.oms_master_container` oms on logs.sku = oms.sku
+left join `data_pool_real_time.ims_prieds_master_products` mt on mt.sku = logs.sku
+WHERE
+  SUBSTRING(logs.sku, 1, 2) = '75'),
+            
+    calendar_sku_store_combination AS (
+      SELECT
+        date(c.date_timestamp) date_timestamp,
+        sc.store_code,
+        sk.sku,
+        sk.description
+      FROM
+        calendar c
+        CROSS JOIN stores sc
+        cross join sku sk),
+
+      so_qty_date AS (
+        SELECT
+          DATE(TIMESTAMP_MILLIS(il.created_at)) AS so_date,
+          il.site AS site,
+          sk.sku AS sku,
+          CASE
+            WHEN il.action IN ('stockopname.update', 'beginning_balance.create','stocktransferwithsloc.create') THEN il.new_qty
+            ELSE NULL
+          END AS raw_so_qty
+        FROM
+          `data_pool_real_time.ims_prieds_inventory_logs` il
+        left join
+          sku sk on il.sku = sk.sku
+        WHERE
+            il.action IN (
+            'stockopname.update',
+            'beginning_balance.create',
+            'stocktransferwithsloc.create'
+          )
+          AND il.zone IN ('FFL', 'Packaging', 'PACKAGING')
+          and il.adjustment_qty > 0),
+      
+      latest_so AS (
+        SELECT
+          site,
+          sku,
+          MAX(so_date) AS latest_so_date
+        FROM
+          so_qty_date
+      GROUP BY
+          site,
+          sku
+      ),
+      
+      ib_qty_date AS (
+  SELECT
+    DATE(TIMESTAMP_MILLIS(il.created_at)) AS ib_date,
+    il.site AS site,
+    il.sku AS sku,
+    ls.latest_so_date,
+    sum(CASE
+      WHEN il.action = 'putaway.update' THEN il.new_qty
+      ELSE 0 end)
+    AS inbound_qty
+  FROM
+    `data_pool_real_time.ims_prieds_inventory_logs` il
+  LEFT JOIN sku sk
+    ON il.sku = sk.sku
+  left join latest_so ls on ls.sku = il.sku and ls.site = il.site
+  WHERE
+    il.action = 'putaway.update'
+    AND il.zone IN ('FFL', 'Packaging', 'PACKAGING')
+    and DATE(TIMESTAMP_MILLIS(il.created_at)) >= ls.latest_so_date
+    and il.adjustment_qty > 0
+  group by 1,2,3,4
+),
+    
+    daily_orders AS (
+      SELECT
+        order_date,
+        store_code,
+        sku,
+        description,
+        SUM(daily_out) AS daily_out
+      FROM
+        (
+          SELECT
+            DATE(TIMESTAMP_MILLIS(f.paid_at)) AS order_date,
+            s.store_code,
+            o.container_name AS description,
+            o.sku,
+            SUM(o.sum) AS daily_out
+          FROM
+            `dbt_models.fct_transaction_allofresh` f
+            LEFT JOIN (
+              SELECT
+                oc.container_barcode,
+                sk.sku,
+                oc.order_id,
+                m.container_name,
+                SUM(oc.container_sequence) AS sum
+              FROM
+                `data_pool.oms_order_container` oc
+                LEFT JOIN `data_pool.oms_master_container` m ON oc.container_barcode = m.container_barcode
+                left join sku sk on m.sku = sk.sku
+              GROUP BY
+                oc.container_barcode,
+                sk.sku,
+                oc.order_id,
+                m.container_name
+            ) o ON f.order_id = o.order_id
+            left join stores s on f.store_code = s.store_code
+            left join latest_so ls on f.store_code = substring(ls.site,1,5) and o.sku = ls.sku
+          WHERE
+            f.paid_at IS NOT NULL
+            AND o.container_barcode IS NOT NULL
+            AND o.container_barcode <> ''
+            AND o.container_name IS NOT NULL
+            and DATE(TIMESTAMP_MILLIS(f.paid_at)) >= ls.latest_so_date
+          GROUP BY
+            order_date,
+            store_code,
+            o.sku,
+            description
+        )
+      GROUP BY
+        order_date,
+        store_code,
+        sku,
+        description
+    )
+    ,
+    
+    so_mapping AS (
+      select c.date_timestamp,c.store_code, c.sku, c.description, lo.latest_so_date, COALESCE(sqd.raw_so_qty,0) as so_qty from calendar_sku_store_combination c 
+      left join latest_so lo on c.store_code = substring(lo.site,1,5) and c.sku = lo.sku 
+      join so_qty_date sqd on  c.store_code = substring(sqd.site,1,5) and c.sku = sqd.sku and lo.latest_so_date = sqd.so_date
+      where c.date_timestamp >= sqd.so_date
+    )
+    ,
+    
+    so_map as (
+    select ls.latest_so_date as so_date, ls.site, ls.sku, sqd.raw_so_qty as so_qty from latest_so ls left join so_qty_date sqd on sqd.so_date = ls.latest_so_date and sqd.sku =ls.sku and sqd.site = ls.site),
+    
+--     ib_mapping AS (
+--   SELECT
+--     c.date_timestamp,
+--     c.store_code,
+--     c.sku,
+--     c.description,
+--     -- Forward-fill inbound quantity
+--     COALESCE(
+--     --   LAST_VALUE(
+--       ib.inbound_qty 
+--     --   IGNORE NULLS) 
+--     --     OVER (
+--     --       PARTITION BY c.store_code, c.sku
+--     --       ORDER BY c.date_timestamp
+--     --       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+--         -- )
+--         ,
+--       0
+--     ) AS ib_qty
+--   FROM calendar_sku_store_combination c
+--   LEFT JOIN ib_qty_date ib
+--     ON c.date_timestamp = ib.ib_date
+--   AND c.store_code = SUBSTRING(ib.site, 1, 5)
+--   AND c.sku = ib.sku
+--   LEFT JOIN latest_so lo
+--     ON c.store_code = SUBSTRING(lo.site,1,5)
+--   AND c.sku = lo.sku
+--   AND c.date_timestamp = lo.latest_so_date
+--   WHERE 
+--     c.date_timestamp >= lo.latest_so_date
+-- ),
+ 
+--     daily_sales_mapping as (
+--     select c.date_timestamp,c.store_code, c.sku, c.description, COALESCE(do.daily_out,0) as daily_out from calendar_sku_store_combination c left join daily_orders do on c.date_timestamp = do.order_date and c.store_code = do.store_code and c.sku = do.sku
+--     )
+--     ,
+    
+--     cummulative_orders AS (
+--   SELECT
+--     css.date_timestamp,
+--     css.store_code,
+--     css.sku,
+--     COALESCE(d.daily_out, 0) AS daily_out,
+--     COALESCE(ib.ib_qty, 0) AS ib_qty,
+
+--     -- create a reset flag whenever latest_so_date OR inbound date
+--     CASE
+--       WHEN css.date_timestamp = sm.latest_so_date THEN 1
+--       WHEN css.date_timestamp = iqd.ib_date THEN 1
+--       ELSE 0
+--     END AS reset_flag,
+
+--     sm.latest_so_date
+--   FROM
+--     calendar_sku_store_combination css
+--   LEFT JOIN daily_orders d
+--     ON css.date_timestamp = d.order_date
+--   AND css.store_code = d.store_code
+--   AND css.sku = d.sku
+--   LEFT JOIN ib_mapping ib
+--     ON css.date_timestamp = ib.date_timestamp
+--   AND css.store_code = ib.store_code
+--   AND css.sku = ib.sku
+--   LEFT JOIN ib_qty_date iqd
+--     ON css.store_code = substring(iqd.site,1,5)
+--   AND css.sku = iqd.sku
+--   AND css.date_timestamp = iqd.ib_date
+--   LEFT JOIN so_mapping sm
+--     ON css.date_timestamp = sm.date_timestamp
+--   AND css.store_code = sm.store_code
+--   AND css.sku = sm.sku
+-- ),
+
+-- cummulative_with_batches AS (
+--   SELECT
+--     c.*,
+--     SUM(reset_flag) OVER (
+--       PARTITION BY store_code, sku
+--       ORDER BY date_timestamp
+--       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+--     ) AS batch_id
+--   FROM cummulative_orders c
+-- ),
+
+-- cummulative_final AS (
+--   SELECT
+--     c.date_timestamp,
+--     c.store_code,
+--     c.sku,
+--     c.daily_out,
+--     c.ib_qty,
+--     c.latest_so_date,
+--     c.batch_id,
+
+--     -- now cumulative resets inside each batch
+--     SUM(c.daily_out) OVER (
+--       PARTITION BY c.store_code, c.sku, c.batch_id
+--       ORDER BY c.date_timestamp
+--       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+--     ) AS cum_out
+--   FROM cummulative_with_batches c
+--   where c.latest_so_date <= c.date_timestamp
+-- )
+-- ,
+    
+   prefin1 AS (
+  SELECT
+    css.date_timestamp,
+    css.store_code,
+    css.sku,
+    css.description,
+    COALESCE(so.so_qty, 0) AS so_qty,
+    COALESCE(do.daily_out, 0) AS daily_out,
+    COALESCE(ib.inbound_qty, 0) AS inbound_qty,
+    COALESCE(ib.inbound_qty,0) + COALESCE(so.so_qty,0) - COALESCE(do.daily_out,0) AS net_flow
+  FROM calendar_sku_store_combination css
+  LEFT JOIN so_map so
+    ON css.date_timestamp = so.so_date
+   AND css.store_code = SUBSTRING(so.site,1,5)
+   AND css.sku = so.sku
+  LEFT JOIN daily_orders do
+    ON css.date_timestamp = do.order_date
+   AND css.store_code = do.store_code
+   AND css.sku = do.sku
+  LEFT JOIN ib_qty_date ib
+    ON css.date_timestamp = ib.ib_date
+   AND css.store_code = SUBSTRING(ib.site,1,5)
+   AND css.sku = ib.sku
+),
+-- Step 1: compute cumulative net flow
+cum AS (
+  SELECT
+    *,
+    SUM(net_flow) OVER (
+      PARTITION BY store_code, sku
+      ORDER BY date_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS cum_flow
+  FROM prefin1
+),
+
+-- Step 2: mark reset when inbound arrives after cum_flow was ≤ 0
+resets AS (
+  SELECT
+    *,
+    CASE
+      WHEN inbound_qty > 0
+           AND LAG(cum_flow) OVER (PARTITION BY store_code, sku ORDER BY date_timestamp) <= 0
+      THEN 1 ELSE 0 END AS reset_flag
+  FROM cum
+),
+
+-- Step 3: group by reset_flag
+reset_groups AS (
+  SELECT
+    *,
+    SUM(reset_flag) OVER (
+      PARTITION BY store_code, sku
+      ORDER BY date_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS reset_group
+  FROM resets
+),
+
+-- Step 4: compute running stock within reset groups
+prefin2 AS (
+  SELECT
+    date_timestamp,
+    store_code,
+    sku,
+    description,
+    so_qty,
+    daily_out,
+    inbound_qty,
+    net_flow,
+    reset_flag,
+    GREATEST(
+      SUM(net_flow) OVER (
+        PARTITION BY store_code, sku, reset_group
+        ORDER BY date_timestamp
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ),
+      0
+    ) AS current_stock
+  FROM reset_groups
+)
+
+SELECT 
+p2.date_timestamp, 
+case 
+   when iqd.site = '83502 AlloFresh Daan Mogot' then 'DMT' 
+   when iqd.site = '83503 AlloFresh Gading Serpong' then 'GS' 
+   when iqd.site = '83504 AlloFresh Lebak Bulus' then 'LBB' 
+   when iqd.site = '83505 AlloFresh Pluit' then 'PLT' 
+   when iqd.site = '83510 AlloFresh Cawang' then 'CWG' 
+   when iqd.site = '83512 Allofresh Cempaka Putih Galur' then 'GLR' 
+   when iqd.site = '83514 Allofresh Cipondoh' then 'CPD' 
+   when iqd.site = '83516 Allofresh Kembangan' then 'KMB' 
+   when iqd.site = '83559 AF ISW Central Park Tj Duren' then 'TJD' 
+   when iqd.site = '83617 AF ISW Bintaro' then 'BTR' 
+   end as site, 
+p2.sku, 
+p2.description, 
+p2.daily_out, 
+p2.current_stock
+FROM prefin2 p2
+left join (select distinct site from `data_pool_real_time.ims_prieds_inventories`) iqd on p2.store_code = substring(iqd.site,1,5)
+where 
+date_timestamp = current_date()-1
+ORDER BY 
+store_code, 
+sku,
+date_timestamp

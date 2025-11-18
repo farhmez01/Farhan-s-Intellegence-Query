@@ -1,0 +1,408 @@
+-- 🧾 Weekly Breakage vs GMV Summary (AlloFresh)
+WITH handling_category AS (
+  SELECT handling_category
+  FROM UNNEST([
+    'Breads','Dry Chilled','Frozen','Vegetables',
+    'Local Fruit','Import Fruit','Eggs','Poultry','Beef','Seafood','Dry'
+  ]) AS handling_category
+),
+
+calender AS (
+  SELECT
+    DATE_SUB(CURRENT_DATE(), INTERVAL x DAY) AS date_timestamp
+  FROM UNNEST(GENERATE_ARRAY(0, 90)) AS x
+),
+
+store AS (
+  SELECT
+  distinct store_code
+FROM
+  `data_mart.sku_master_monitoring_refined` 
+  union all
+  SELECT '88800' AS store_code
+),
+
+reasons_adjustment as(
+SELECT *
+FROM UNNEST([
+  STRUCT(
+    'EXP' AS reasons,
+    'Beef' AS categories,
+    'Inherited Stocks' AS reasons_adj
+  ),
+  STRUCT(
+    'BBX' AS reasons,
+    'Beef' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'MG' AS reasons,
+    'Beef' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'EXP' AS reasons,
+    'Dry' AS categories,
+    'Inherited Stocks' AS reasons_adj
+  ),
+  STRUCT(
+    'BBX' AS reasons,
+    'Dry' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'MG' AS reasons,
+    'Dry' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'EXP' AS reasons,
+    'Dry Chilled' AS categories,
+    'Inherited Stocks' AS reasons_adj
+  ),
+  STRUCT(
+    'BBX' AS reasons,
+    'Dry Chilled' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'MG' AS reasons,
+    'Dry Chilled' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'EXP' AS reasons,
+    'Frozen' AS categories,
+    'Inherited Stocks' AS reasons_adj
+  ),
+  STRUCT(
+    'BBX' AS reasons,
+    'Frozen' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'MG' AS reasons,
+    'Frozen' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'EXP' AS reasons,
+    'Import Fruit' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'BBX' AS reasons,
+    'Import Fruit' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'MG' AS reasons,
+    'Import Fruit' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'EXP' AS reasons,
+    'Local Fruit' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'BBX' AS reasons,
+    'Local Fruit' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'MG' AS reasons,
+    'Local Fruit' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'EXP' AS reasons,
+    'Poultry' AS categories,
+    'Inherited Stocks' AS reasons_adj
+  ),
+  STRUCT(
+    'BBX' AS reasons,
+    'Poultry' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'MG' AS reasons,
+    'Poultry' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'EXP' AS reasons,
+    'Seafood' AS categories,
+    'Inherited Stocks' AS reasons_adj
+  ),
+  STRUCT(
+    'BBX' AS reasons,
+    'Seafood' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'MG' AS reasons,
+    'Seafood' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'EXP' AS reasons,
+    'Vegetables' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'BBX' AS reasons,
+    'Vegetables' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'MG' AS reasons,
+    'Vegetables' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'EXP' AS reasons,
+    'Eggs' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'BBX' AS reasons,
+    'Eggs' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'MG' AS reasons,
+    'Eggs' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'EXP' AS reasons,
+    'Breads' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'BBX' AS reasons,
+    'Breads' AS categories,
+    'True Waste' AS reasons_adj
+  ),
+  STRUCT(
+    'MG' AS reasons,
+    'Breads' AS categories,
+    'True Waste' AS reasons_adj
+  )
+])
+),
+
+calender_hc_comb AS (
+  SELECT hc.handling_category, c.date_timestamp, s.store_code, ra.reasons_adj,ra2.reasons
+  FROM handling_category hc
+  CROSS JOIN calender c
+  CROSS JOIN store s
+  CROSS JOIN (select distinct reasons_adj from reasons_adjustment) ra
+  cross join (select distinct reasons from reasons_adjustment) ra2
+),
+-- 🧩 Disposal Data
+disposal_data AS (
+  select d.date_timestamp,d.site,d.handling_category, coalesce(d.reasons,"EXP") reasons, coalesce(ra.reasons_adj,"True Waste") reasons_adj, sum(d.disposal_value) as disposal_value from (
+SELECT
+  DATE(TIMESTAMP_MILLIS(dps.created_at)) AS date_timestamp,
+  dps.site,
+  CASE
+    WHEN SUBSTRING(dps.sku, 1, 3) IN ('154') THEN 'Breads'
+    WHEN SUBSTRING(dps.sku, 1, 3) = '150' THEN 'Dry Chilled'
+    WHEN SUBSTRING(dps.sku, 1, 3) IN ('151', '152', '153')
+    OR SUBSTRING(dps.sku, 1, 5) IN ('21052', '21060', '22151', '22042') THEN 'Frozen'
+    WHEN SUBSTRING(dps.sku, 1, 3) = '220' THEN 'Vegetables'
+    WHEN SUBSTRING(dps.sku, 1, 3) = '221'
+    AND mp.sub_family IN (
+      'LOCAL FRUIT',
+      'LOCAL',
+      'PREPACKED',
+      'CUT FRUITS',
+      'SALTED/SWEETENED FRUITS'
+    ) THEN 'Local Fruit'
+    WHEN SUBSTRING(dps.sku, 1, 3) = '221'
+    AND mp.sub_family IN ('IMPORT FRUIT', 'IMPORT') THEN 'Import Fruit'
+    WHEN SUBSTRING(dps.sku, 1, 4) = '2434' THEN 'Eggs'
+    WHEN SUBSTRING(dps.sku, 1, 3) IN ('243', '244') THEN 'Poultry'
+    WHEN SUBSTRING(dps.sku, 1, 3) = '240' THEN 'Beef'
+    WHEN SUBSTRING(dps.sku, 1, 2) = '21' THEN 'Seafood'
+    ELSE 'Dry'
+  END AS handling_category,
+  dps.sku,
+  dps.disposed_qty,
+  sp.cpp,
+  upper(coalesce(bm.rea, bm2.rea)) AS reasons,
+  dps.disposed_qty * sp.cpp AS disposal_value
+FROM
+  (
+    SELECT
+      logs.created_at,
+      logs.site,
+      logs.sku,
+      TRIM(
+        REGEXP_SUBSTR(logs.source, '([A-Z]+-[0-9]+-[0-9]+)')
+      ) AS source,
+      -1 * logs.adjustment_qty AS disposed_qty
+    FROM
+      `tri-omnichannel-prd.data_pool_real_time.ims_prieds_inventory_logs` AS logs
+    WHERE
+      logs.action = 'stockopname.update'
+      AND logs.adjustment_qty < 0
+      AND logs.zone IN ('BAD', 'BREAKAGE')
+    UNION ALL
+    SELECT
+      sto.created_at,
+      sto.site_origin AS site,
+      ci.sku,
+      sto.document_id AS source,
+      SUM(ci.qty) AS disposed_qty
+    FROM
+      `tri-omnichannel-prd.data_pool_real_time.ims_prieds_stock_transfer_orders` AS sto
+      LEFT JOIN `tri-omnichannel-prd.data_pool_real_time.ims_prieds_stock_transfer_order_cart_items` AS ci ON sto.id = ci.stock_transfer_order_id
+    WHERE
+      sto.site_origin <> '88800 DC AlloFresh Marunda'
+      AND LOWER(sto.remark_requester) LIKE '%bad%'
+      AND ci.sku IS NOT NULL
+    GROUP BY
+      ALL
+    UNION ALL
+    SELECT
+      logs.created_at,
+      logs.site,
+      logs.sku,
+      TRIM(
+        REGEXP_SUBSTR(logs.source, '([A-Z]+-[0-9]+-[0-9]+)')
+      ) AS source,
+      logs.adjustment_qty AS disposed_qty
+    FROM
+      `tri-omnichannel-prd.data_pool_real_time.ims_prieds_inventory_logs` AS logs
+    WHERE
+      logs.adjustment_qty > 0
+      AND logs.zone = 'SDM'
+      AND logs.site = '88800 DC AlloFresh Marunda'
+  ) dps
+  LEFT JOIN `data_mart.allofresh_family_tree` AS mp ON SUBSTRING(dps.sku, 1, 5) = mp.sub_family_code
+  LEFT JOIN (
+    SELECT
+      product_sku,
+      AVG(normal_purchase_price) AS cpp
+    FROM
+      data_mart.price_vendor_historical
+    WHERE
+      airflow_end_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 40 DAY) AND CURRENT_DATE()
+      AND normal_purchase_price IS NOT NULL
+    GROUP BY
+      ALL
+  ) AS sp ON dps.sku = sp.product_sku
+  LEFT JOIN (
+    SELECT
+      sku,
+      description
+    FROM
+      data_pool_real_time.ims_prieds_master_products
+  ) ms ON dps.sku = ms.sku
+  LEFT JOIN `data_mart.breakage_monitoring_on_store` bm ON dps.source = bm.doc_wms
+  AND dps.sku = bm.sku_id
+  LEFT JOIN `data_mart.breakage_monitoring_on_store` bm2 ON dps.source = bm2.doc_wms
+  AND ms.description = bm2.product_name
+GROUP BY
+  ALL) d
+  left join reasons_adjustment ra on d.handling_category = ra.categories and d.reasons = ra.reasons
+  group by all
+),
+
+-- 🧾 Sales GMV Data
+sales_data AS (
+  SELECT 
+    sales_date AS date_timestamp,
+    site,
+    store_name,
+    handling_category,
+    'True Waste' as reasons_adj,
+    'EXP' as reasons,
+    SUM(total_gmv) AS total_gmv
+  FROM (
+    SELECT
+      DATE(TIMESTAMP_MILLIS(transaction_allofresh.pos_sales_date)) AS sales_date,
+      transaction_allofresh.store_code AS site,
+      transaction_allofresh.store_name AS store_name,
+      CASE
+        WHEN SUBSTRING(CAST(p.sku AS STRING), 1, 3) IN ('154') THEN 'Breads'
+        WHEN SUBSTRING(CAST(p.sku AS STRING), 1, 3) = '150' THEN 'Dry Chilled'
+        WHEN SUBSTRING(CAST(p.sku AS STRING), 1, 3) IN ('151','152','153')
+          OR SUBSTRING(CAST(p.sku AS STRING), 1, 5) IN ('21052','21060','22151','22042') THEN 'Frozen'
+        WHEN SUBSTRING(CAST(p.sku AS STRING), 1, 3) = '220' THEN 'Vegetables'
+        WHEN SUBSTRING(CAST(p.sku AS STRING), 1, 3) = '221'
+          AND p.sub_family IN ('LOCAL FRUIT','LOCAL','PREPACKED','CUT FRUITS','SALTED/SWEETENED FRUITS') THEN 'Local Fruit'
+        WHEN SUBSTRING(CAST(p.sku AS STRING), 1, 3) = '221'
+          AND p.sub_family IN ('IMPORT FRUIT','IMPORT') THEN 'Import Fruit'
+        WHEN SUBSTRING(CAST(p.sku AS STRING), 1, 4) = '2434' THEN 'Eggs'
+        WHEN SUBSTRING(CAST(p.sku AS STRING), 1, 3) IN ('243','244') THEN 'Poultry'
+        WHEN SUBSTRING(CAST(p.sku AS STRING), 1, 3) = '240' THEN 'Beef'
+        WHEN SUBSTRING(CAST(p.sku AS STRING), 1, 2) = '21' THEN 'Seafood'
+        ELSE 'Dry'
+      END AS handling_category,
+      SUM(p.gmv) AS total_gmv
+    FROM `tri-omnichannel-prd.dbt_models.fct_transaction_allofresh` AS transaction_allofresh
+    LEFT JOIN UNNEST(transaction_allofresh.cart_item_details) AS p
+  WHERE
+  1=1
+  and upper(store_name) like '%ALLOFRESH%' 
+  AND (transaction_allofresh.order_id_code ) = 'app'
+  AND (transaction_allofresh.transaction_state ) IN ('Completed', 'Delivered', 'Waiting for Courier to Pickup', 'Waiting for Customer to Pickup')
+    GROUP BY sales_date, transaction_allofresh.store_code, transaction_allofresh.store_name, handling_category
+  )
+  GROUP BY date_timestamp, site, store_name, handling_category, reasons_adj
+),
+
+-- 🧮 Combine Disposal + GMV
+combined AS (
+  SELECT 
+    hc.handling_category, 
+    hc.date_timestamp AS date_timestamp,
+    extract (isoweek from hc.date_timestamp) as weeknum,
+    extract (month from hc.date_timestamp) as month,
+    hc.store_code AS site,
+    st.store_name,
+    hc.reasons_adj,
+    hc.reasons,
+    COALESCE(SUM(d.disposal_value), 0) AS total_disposal_value,
+    COALESCE(s.total_gmv, 0) AS total_gmv
+  FROM calender_hc_comb hc
+  LEFT JOIN sales_data s
+    ON hc.date_timestamp = s.date_timestamp
+    AND hc.store_code = s.site
+    AND hc.handling_category = s.handling_category
+    and hc.reasons_adj = s.reasons_adj
+    and hc.reasons = s.reasons
+  left join disposal_data d
+    ON hc.handling_category = d.handling_category 
+    AND hc.date_timestamp = d.date_timestamp 
+    AND hc.store_code = SUBSTRING(d.site, 1, 5)
+    and hc.reasons_adj = d.reasons_adj
+    and hc.reasons = d.reasons
+  LEFT JOIN `tri-omnichannel-prd.data_pool_real_time.ims_store` st
+    on hc.store_code = st.store_code
+  GROUP BY 1,2,3,4,5,6,7,8,10
+)
+
+SELECT
+  month,
+  weeknum,
+  extract (day from date_timestamp) as daynum,
+  date_timestamp,
+  site,
+  store_name,
+  handling_category,
+  reasons,
+  reasons_adj,
+  total_disposal_value,
+  total_gmv,
+  SAFE_DIVIDE(total_disposal_value, SUM(total_gmv) OVER (PARTITION BY date_timestamp,site)) AS Breakage_to_GMV_per_loc,
+ SAFE_DIVIDE(total_disposal_value, SUM(total_gmv) OVER (PARTITION BY date_timestamp,handling_category)) AS Breakage_to_GMV_per_cat,
+  SAFE_DIVIDE(
+    total_disposal_value,
+    SUM(total_gmv) OVER (PARTITION BY date_timestamp)
+  ) AS Breakage_to_GMV_overall
+FROM combined

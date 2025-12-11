@@ -1,0 +1,158 @@
+WITH expiry_agg AS (
+  SELECT
+    pil.sku,
+    pmp.description AS sku_description,
+    pil.site,
+    SAFE.DATE_FROM_UNIX_DATE(CAST(pil.expired_date AS INT64)) AS expired_date,
+    SUM(CASE
+          WHEN pil.action = 'putaway.update'
+           AND pil.adjustment_qty > 0
+           AND (pil.site <> '88800 DC AlloFresh Marunda' OR pil.site IS NULL)
+          THEN pil.adjustment_qty
+          WHEN pil.action = 'stocktransferwithsloc.create'
+           AND pil.zone = 'STAGING INBOUND'
+           AND pil.adjustment_qty < 0
+           AND (pil.site <> '88800 DC AlloFresh Marunda' OR pil.site IS NULL)
+          THEN -1 * pil.adjustment_qty
+          ELSE 0
+        END) AS inbound,
+    SUM(CASE
+          WHEN pil.action = 'picklist.update'
+           AND pil.sloc = 'STAGING OUTBOUND'
+           AND pil.adjustment_qty < 0
+          THEN -1 * pil.adjustment_qty
+          ELSE 0
+        END) AS sales,
+    SUM(CASE
+          WHEN pil.action = 'stockopname.update'
+           AND pil.adjustment_qty < 0
+           AND pil.zone = 'BAD'
+           AND (pil.sloc <> 'ED Correction-out' OR pil.sloc IS NULL)
+          THEN -1 * pil.adjustment_qty
+          WHEN pil.action = 'stockopname.update'
+           AND pil.adjustment_qty < 0
+           AND pil.zone = 'QUARANTINE'
+          THEN -1 * pil.adjustment_qty
+          ELSE 0
+        END) AS breakage
+  FROM `data_pool.ims_prieds_inventory_logs` pil
+  LEFT JOIN `data_pool.ims_prieds_master_products` pmp
+    ON pil.sku = pmp.sku AND pil.site = pmp.site
+  WHERE SAFE.DATE_FROM_UNIX_DATE(CAST(pil.expired_date AS INT64))
+           BETWEEN CURRENT_DATE('Asia/Jakarta')
+           AND DATE_ADD(CURRENT_DATE('Asia/Jakarta'), INTERVAL 3600 DAY)
+    AND pil.sku NOT LIKE '75%'
+  GROUP BY pil.sku, pmp.description, pil.site,
+           SAFE.DATE_FROM_UNIX_DATE(CAST(pil.expired_date AS INT64))
+  HAVING inbound > 0
+),
+
+calc AS (
+  SELECT *,
+    (IFNULL(inbound,0) - IFNULL(sales,0) - IFNULL(breakage,0)) AS remaining
+  FROM expiry_agg
+),
+
+final AS (
+  SELECT
+    c.*,
+    ROW_NUMBER() OVER (PARTITION BY c.site, c.sku ORDER BY c.expired_date ASC) AS rn
+  FROM calc c
+),
+
+with_sums AS (
+  SELECT
+    *,
+    COALESCE(
+      SUM(remaining) OVER (
+        PARTITION BY site, sku
+        ORDER BY expired_date
+        ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+      ), 0
+    ) AS prev_total_remaining,
+    COALESCE(
+      SUM(remaining) OVER (
+        PARTITION BY site, sku
+        ORDER BY expired_date
+        ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING
+      ), 0
+    ) AS after_total_remaining
+  FROM final
+),
+
+with_initial_flag AS (
+  SELECT
+    *,
+    -- your explicit FEFO rule: FEFO (0) only when prev_total_remaining = 0 AND (remaining=0 OR (sales=0 AND after_total_remaining=0))
+    CASE
+  WHEN prev_total_remaining = 0
+       AND (
+            remaining = 0                     -- normal FEFO
+            OR after_total_remaining = 0      -- NEW: last expiry with no newer stock
+           )
+    THEN 0
+  ELSE 1
+END AS initial_not_fefo
+  FROM with_sums
+),
+
+with_precedent AS (
+  SELECT
+    *,
+    LAG(initial_not_fefo) OVER (PARTITION BY site, sku ORDER BY expired_date) AS prev_initial_not_fefo,
+    CASE
+      WHEN LAG(initial_not_fefo) OVER (PARTITION BY site, sku ORDER BY expired_date) = 0
+           AND (inbound = sales OR sales = 0)
+        THEN 0
+      ELSE initial_not_fefo
+    END AS adj_not_fefo
+  FROM with_initial_flag
+),
+
+-- cumulative violation but we only apply cascade to rows that actually have sales.
+with_cumulative AS (
+  SELECT
+    *,
+    MAX(adj_not_fefo) OVER (
+      PARTITION BY site, sku
+      ORDER BY expired_date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS cum_violation
+  FROM with_precedent
+),
+
+final_decision AS (
+  SELECT
+    *,
+    -- Final rule to avoid marking zero-sales rows as violations:
+    -- If sales = 0 => always FEFO clean (0).
+    -- Else => use cumulative violation (so prior violations still mark downstream sold rows).
+    CASE
+      WHEN sales = 0 THEN 0
+      ELSE cum_violation
+    END AS not_fefo_flag
+  FROM with_cumulative
+)
+
+SELECT
+  sku,
+  sku_description,
+  site,
+  expired_date,
+  inbound,
+  sales,
+  breakage,
+  remaining,
+  case
+  when not_fefo_flag = 1 and COALESCE(LEAD(not_fefo_flag) OVER (PARTITION BY sku, site ORDER BY expired_date),0) = 1 and sales = 0 then 0
+  when not_fefo_flag = 1 and COALESCE(LEAD(not_fefo_flag) OVER (PARTITION BY sku, site ORDER BY expired_date),0) = 0 and after_total_remaining <> 0 and COALESCE(LEAD(sales) OVER (PARTITION BY sku, site ORDER BY expired_date),0) = 0 then 0
+  when not_fefo_flag = 1 and COALESCE(LEAD(not_fefo_flag) OVER (PARTITION BY sku, site ORDER BY expired_date),0) = 0 and after_total_remaining <> 0 then 1
+  when not_fefo_flag = 0 and COALESCE(LEAD(not_fefo_flag) OVER (PARTITION BY sku, site ORDER BY expired_date),0) = 1 then 0
+  when not_fefo_flag = 0 and COALESCE(LEAD(not_fefo_flag) OVER (PARTITION BY sku, site ORDER BY expired_date),0) = 0 then 0
+  else 1
+  end as fefo_error
+FROM final_decision
+WHERE 
+1=1
+and inbound > 0
+ORDER BY sku, site, expired_date

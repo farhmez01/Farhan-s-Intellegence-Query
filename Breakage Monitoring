@@ -9,7 +9,7 @@ WITH handling_category AS (
 
 calender AS (
   SELECT
-    DATE_SUB(CURRENT_DATE(), INTERVAL x DAY) AS date_timestamp
+    DATE_SUB(CURRENT_DATE('Asia/Jakarta'), INTERVAL x DAY) AS date_timestamp
   FROM UNNEST(GENERATE_ARRAY(0, 90)) AS x
 ),
 
@@ -17,7 +17,7 @@ store AS (
   SELECT
   distinct store_code
 FROM
-  `data_mart.sku_master_monitoring_refined` 
+  `data_mart.sku_master_monitoring_refined`
   union all
   SELECT '88800' AS store_code
 ),
@@ -203,9 +203,9 @@ calender_hc_comb AS (
 ),
 -- 🧩 Disposal Data
 disposal_data AS (
-  select d.date_timestamp,d.site,d.handling_category, coalesce(d.reasons,"EXP") reasons, coalesce(ra.reasons_adj,"True Waste") reasons_adj, sum(d.disposal_value) as disposal_value from (
+  select d.date_timestamp,d.site,d.handling_category, d.reasons, coalesce(ra.reasons_adj,"True Waste") reasons_adj, sum(d.disposal_value) as disposal_value from (
 SELECT
-  DATE(TIMESTAMP_MILLIS(dps.created_at)) AS date_timestamp,
+  DATE(TIMESTAMP_MILLIS(dps.created_at),'Asia/Jakarta') AS date_timestamp,
   dps.site,
   CASE
     WHEN SUBSTRING(dps.sku, 1, 3) IN ('154') THEN 'Breads'
@@ -232,7 +232,7 @@ SELECT
   dps.sku,
   dps.disposed_qty,
   sp.cpp,
-  upper(coalesce(bm.rea, bm2.rea)) AS reasons,
+  upper(coalesce(coalesce(coalesce(dps.reasons,bm.rea), bm2.rea),'EXP')) AS reasons,
   dps.disposed_qty * sp.cpp AS disposal_value
 FROM
   (
@@ -243,11 +243,13 @@ FROM
       TRIM(
         REGEXP_SUBSTR(logs.source, '([A-Z]+-[0-9]+-[0-9]+)')
       ) AS source,
-      -1 * logs.adjustment_qty AS disposed_qty
+      -1 * logs.adjustment_qty AS disposed_qty,
+      null as reasons
     FROM
       `tri-omnichannel-prd.data_pool_real_time.ims_prieds_inventory_logs` AS logs
     WHERE
       logs.action = 'stockopname.update'
+      and logs.sloc <> 'ED Correction-out'
       AND logs.adjustment_qty < 0
       AND logs.zone IN ('BAD', 'BREAKAGE')
     UNION ALL
@@ -256,7 +258,8 @@ FROM
       sto.site_origin AS site,
       ci.sku,
       sto.document_id AS source,
-      SUM(ci.qty) AS disposed_qty
+      ci.qty AS disposed_qty,
+      null as reasons
     FROM
       `tri-omnichannel-prd.data_pool_real_time.ims_prieds_stock_transfer_orders` AS sto
       LEFT JOIN `tri-omnichannel-prd.data_pool_real_time.ims_prieds_stock_transfer_order_cart_items` AS ci ON sto.id = ci.stock_transfer_order_id
@@ -264,8 +267,6 @@ FROM
       sto.site_origin <> '88800 DC AlloFresh Marunda'
       AND LOWER(sto.remark_requester) LIKE '%bad%'
       AND ci.sku IS NOT NULL
-    GROUP BY
-      ALL
     UNION ALL
     SELECT
       logs.created_at,
@@ -274,26 +275,45 @@ FROM
       TRIM(
         REGEXP_SUBSTR(logs.source, '([A-Z]+-[0-9]+-[0-9]+)')
       ) AS source,
-      logs.adjustment_qty AS disposed_qty
+      logs.adjustment_qty AS disposed_qty,
+      CASE
+        when logs.remarks in ('26/09/2025 EXPIRED','Already Expired','Already Expired (01/11/2025)','BADSTOCK','ED','Expired','Near / Already Expired','Near ED','Over Stock','Overstock') then 'EXP'
+        when logs.remarks in ('Bad Defect','Kemasan Rusak','Kemasan Rusak / Lost Vacum','Layu/Busuk/Menghitam','Lost Vacuum','Natural Defect','Packaging Issue','Supplier Issue') then 'BBX'
+        when logs.remarks in ('Bad Damage','Coklat patah','Mishandling') then 'MG'
+        when logs.action = 'putaway' and DATE_FROM_UNIX_DATE(CAST(logs.expired_date AS INT64)) >= date(TIMESTAMP_MILLIS(logs.created_at)) then 'EXP'
+        when logs.action = 'putaway' and DATE_FROM_UNIX_DATE(CAST(logs.expired_date AS INT64)) < date(TIMESTAMP_MILLIS(logs.created_at)) then 'BBX'
+        else null
+        end
+        as reasons
     FROM
       `tri-omnichannel-prd.data_pool_real_time.ims_prieds_inventory_logs` AS logs
     WHERE
       logs.adjustment_qty > 0
-      AND logs.zone = 'SDM'
+      AND logs.sloc = 'RACK BADSTOCK-1'
       AND logs.site = '88800 DC AlloFresh Marunda'
   ) dps
   LEFT JOIN `data_mart.allofresh_family_tree` AS mp ON SUBSTRING(dps.sku, 1, 5) = mp.sub_family_code
   LEFT JOIN (
     SELECT
-      product_sku,
-      AVG(normal_purchase_price) AS cpp
-    FROM
-      data_mart.price_vendor_historical
-    WHERE
-      airflow_end_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 40 DAY) AND CURRENT_DATE()
-      AND normal_purchase_price IS NOT NULL
-    GROUP BY
-      ALL
+  product_sku,
+  AVG(normal_purchase_price) AS cpp
+FROM (
+  SELECT
+    product_sku,
+    normal_purchase_price,
+    ROW_NUMBER() OVER (
+      PARTITION BY product_sku
+      ORDER BY airflow_end_date DESC
+    ) AS rn
+  FROM
+    data_mart.price_vendor_historical
+  WHERE
+    normal_purchase_price IS NOT NULL
+    and airflow_end_date >= "2025-06-01"
+)
+WHERE rn <= 1
+GROUP BY
+  product_sku
   ) AS sp ON dps.sku = sp.product_sku
   LEFT JOIN (
     SELECT
@@ -314,7 +334,7 @@ GROUP BY
 
 -- 🧾 Sales GMV Data
 sales_data AS (
-  SELECT 
+  SELECT
     sales_date AS date_timestamp,
     site,
     store_name,
@@ -324,7 +344,7 @@ sales_data AS (
     SUM(total_gmv) AS total_gmv
   FROM (
     SELECT
-      DATE(TIMESTAMP_MILLIS(transaction_allofresh.pos_sales_date)) AS sales_date,
+      DATE(TIMESTAMP_MILLIS(transaction_allofresh.pos_sales_date),'Asia/Jakarta') AS sales_date,
       transaction_allofresh.store_code AS site,
       transaction_allofresh.store_name AS store_name,
       CASE
@@ -348,7 +368,7 @@ sales_data AS (
     LEFT JOIN UNNEST(transaction_allofresh.cart_item_details) AS p
   WHERE
   1=1
-  and upper(store_name) like '%ALLOFRESH%' 
+  and upper(store_name) like '%ALLOFRESH%'
   AND (transaction_allofresh.order_id_code ) = 'app'
   AND (transaction_allofresh.transaction_state ) IN ('Completed', 'Delivered', 'Waiting for Courier to Pickup', 'Waiting for Customer to Pickup')
     GROUP BY sales_date, transaction_allofresh.store_code, transaction_allofresh.store_name, handling_category
@@ -358,8 +378,8 @@ sales_data AS (
 
 -- 🧮 Combine Disposal + GMV
 combined AS (
-  SELECT 
-    hc.handling_category, 
+  SELECT
+    hc.handling_category,
     hc.date_timestamp AS date_timestamp,
     extract (isoweek from hc.date_timestamp) as weeknum,
     extract (month from hc.date_timestamp) as month,
@@ -377,8 +397,8 @@ combined AS (
     and hc.reasons_adj = s.reasons_adj
     and hc.reasons = s.reasons
   left join disposal_data d
-    ON hc.handling_category = d.handling_category 
-    AND hc.date_timestamp = d.date_timestamp 
+    ON hc.handling_category = d.handling_category
+    AND hc.date_timestamp = d.date_timestamp
     AND hc.store_code = SUBSTRING(d.site, 1, 5)
     and hc.reasons_adj = d.reasons_adj
     and hc.reasons = d.reasons
@@ -399,10 +419,14 @@ SELECT
   reasons_adj,
   total_disposal_value,
   total_gmv,
-  SAFE_DIVIDE(total_disposal_value, SUM(total_gmv) OVER (PARTITION BY date_timestamp,site)) AS Breakage_to_GMV_per_loc,
- SAFE_DIVIDE(total_disposal_value, SUM(total_gmv) OVER (PARTITION BY date_timestamp,handling_category)) AS Breakage_to_GMV_per_cat,
+  SAFE_DIVIDE(total_disposal_value, SUM(total_gmv) OVER (PARTITION BY weeknum,site)) AS Breakage_to_GMV_per_loc,
+  SAFE_DIVIDE(total_disposal_value, SUM(total_gmv) OVER (PARTITION BY weeknum,handling_category)) AS Breakage_to_GMV_per_cat,
   SAFE_DIVIDE(
     total_disposal_value,
-    SUM(total_gmv) OVER (PARTITION BY date_timestamp)
-  ) AS Breakage_to_GMV_overall
+    SUM(total_gmv) OVER (PARTITION BY weeknum)
+  ) AS Breakage_to_GMV_overall,
+  SAFE_DIVIDE(
+    total_disposal_value,
+    SUM(total_gmv) OVER (PARTITION BY month)
+  ) AS Breakage_to_GMV_overall_monthly
 FROM combined
